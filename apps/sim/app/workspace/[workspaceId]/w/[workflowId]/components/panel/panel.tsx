@@ -652,7 +652,7 @@ export const Panel = memo(function Panel({ workspaceId: propWorkspaceId }: Panel
             <div className='flex gap-1.5'>
               <DropdownMenu open={isMenuOpen} onOpenChange={setIsMenuOpen}>
                 <DropdownMenuTrigger asChild>
-                  <Button className='h-[30px] w-[30px] rounded-[5px]' data-tour='panel-menu'>
+                  <Button className='h-[30px] w-[30px] rounded-[5px]'>
                     <MoreHorizontal />
                   </Button>
                 </DropdownMenuTrigger>
@@ -712,11 +712,10 @@ export const Panel = memo(function Panel({ workspaceId: propWorkspaceId }: Panel
             </div>
 
             {/* Deploy and Run */}
-            <div className='flex gap-1.5' data-tour='deploy-run'>
+            <div className='flex gap-1.5'>
               <Deploy activeWorkflowId={activeWorkflowId} userPermissions={userPermissions} />
               <Button
                 className='h-[30px] gap-2 px-2.5'
-                data-tour='run-button'
                 variant={isExecuting ? 'active' : 'tertiary'}
                 onClick={isExecuting ? cancelWorkflow : () => runWorkflow()}
                 disabled={!isExecuting && isButtonDisabled}
@@ -744,7 +743,6 @@ export const Panel = memo(function Panel({ workspaceId: propWorkspaceId }: Panel
                   variant={_hasHydrated && activeTab === 'copilot' ? 'active' : 'ghost'}
                   onClick={() => handleTabClick('copilot')}
                   data-tab-button='copilot'
-                  data-tour='tab-copilot'
                 >
                   Copilot
                 </Button>
@@ -758,7 +756,6 @@ export const Panel = memo(function Panel({ workspaceId: propWorkspaceId }: Panel
                 variant={_hasHydrated && activeTab === 'toolbar' ? 'active' : 'ghost'}
                 onClick={() => handleTabClick('toolbar')}
                 data-tab-button='toolbar'
-                data-tour='tab-toolbar'
               >
                 Toolbar
               </Button>
@@ -771,7 +768,6 @@ export const Panel = memo(function Panel({ workspaceId: propWorkspaceId }: Panel
                 variant={_hasHydrated && activeTab === 'editor' ? 'active' : 'ghost'}
                 onClick={() => handleTabClick('editor')}
                 data-tab-button='editor'
-                data-tour='tab-editor'
               >
                 Editor
               </Button>

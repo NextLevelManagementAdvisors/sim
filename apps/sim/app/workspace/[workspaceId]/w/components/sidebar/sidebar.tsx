@@ -2,7 +2,7 @@
 
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
-import { Compass, MoreHorizontal } from 'lucide-react'
+import { MoreHorizontal } from 'lucide-react'
 import Image from 'next/image'
 import Link from 'next/link'
 import { useParams, usePathname, useRouter } from 'next/navigation'
@@ -42,10 +42,6 @@ import { cn } from '@/lib/core/utils/cn'
 import { isMacPlatform } from '@/lib/core/utils/platform'
 import { buildFolderTree, getFolderPath } from '@/lib/folders/tree'
 import { captureEvent } from '@/lib/posthog/client'
-import {
-  START_NAV_TOUR_EVENT,
-  START_WORKFLOW_TOUR_EVENT,
-} from '@/app/workspace/[workspaceId]/components/product-tour'
 import { useRegisterGlobalCommands } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
 import { useUserPermissionsContext } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
 import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands-utils'
@@ -282,7 +278,6 @@ const SidebarNavItem = memo(function SidebarNavItem({
     <Link
       href={item.href}
       data-item-id={item.id}
-      data-tour={`nav-${item.id}`}
       className={`${baseClasses} ${hoverClasses} ${activeClasses}`}
       onClick={
         item.onClick
@@ -301,7 +296,6 @@ const SidebarNavItem = memo(function SidebarNavItem({
     <button
       type='button'
       data-item-id={item.id}
-      data-tour={`nav-${item.id}`}
       className={`${baseClasses} ${hoverClasses} ${activeClasses}`}
       onClick={item.onClick}
     >
@@ -774,12 +768,6 @@ export const Sidebar = memo(function Sidebar() {
     ],
     [navigateToSettings, getSettingsHref, setSidebarWidth]
   )
-
-  const handleStartTour = useCallback(() => {
-    window.dispatchEvent(
-      new CustomEvent(isOnWorkflowPage ? START_WORKFLOW_TOUR_EVENT : START_NAV_TOUR_EVENT)
-    )
-  }, [isOnWorkflowPage])
 
   const { data: fetchedTasks = [], isLoading: tasksLoading } = useTasks(workspaceId)
 
@@ -1469,10 +1457,7 @@ export const Sidebar = memo(function Sidebar() {
                   )}
                 >
                   <div ref={scrollContentRef} className='flex flex-col'>
-                    <div
-                      className='tasks-section flex flex-shrink-0 flex-col'
-                      data-tour='nav-tasks'
-                    >
+                    <div className='tasks-section flex flex-shrink-0 flex-col'>
                       <div className='flex h-[18px] flex-shrink-0 items-center justify-between px-4'>
                         <div className='font-base text-[var(--text-icon)] text-small'>
                           All tasks
@@ -1595,10 +1580,7 @@ export const Sidebar = memo(function Sidebar() {
                       )}
                     </div>
 
-                    <div
-                      className='workflows-section relative mt-3.5 flex flex-col'
-                      data-tour='nav-workflows'
-                    >
+                    <div className='workflows-section relative mt-3.5 flex flex-col'>
                       <div className='flex h-[18px] flex-shrink-0 items-center justify-between px-4'>
                         <div className='font-base text-[var(--text-icon)] text-small'>
                           Workflows
@@ -1784,10 +1766,6 @@ export const Sidebar = memo(function Sidebar() {
                       <DropdownMenuItem onSelect={handleOpenHelpFromMenu}>
                         <HelpCircle className='h-[14px] w-[14px]' />
                         Report an issue
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onSelect={handleStartTour}>
-                        <Compass className='h-[14px] w-[14px]' />
-                        Take a tour
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
