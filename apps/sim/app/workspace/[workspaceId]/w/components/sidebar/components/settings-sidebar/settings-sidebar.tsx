@@ -253,12 +253,12 @@ export function SettingsSidebar({
   return (
     <>
       {/* Back button */}
-      <div className='mt-2.5 flex flex-shrink-0 flex-col gap-0.5 px-2'>
+      <div className='mt-3 flex flex-shrink-0 flex-col gap-0.5 px-2'>
         <SidebarTooltip label='Back' enabled={showCollapsedTooltips}>
           <button
             type='button'
             onClick={handleBack}
-            className='group mx-0.5 flex h-[30px] items-center gap-2 rounded-lg px-2 text-sm hover-hover:bg-[var(--surface-hover)]'
+            className='group mx-0.5 flex h-[30px] items-center gap-2 rounded-lg px-2 text-sm hover-hover:bg-[var(--surface-active)]'
           >
             <div className='flex h-[16px] w-[16px] flex-shrink-0 items-center justify-center text-[var(--text-icon)]'>
               <ChevronDown className='h-[10px] w-[10px] rotate-90' />
@@ -271,7 +271,7 @@ export function SettingsSidebar({
       {/* Settings sections */}
       <div
         className={cn(
-          'mt-3.5 flex flex-1 flex-col gap-3.5 pb-2',
+          'mt-3 flex flex-1 flex-col gap-3 pb-2',
           !isCollapsed && 'overflow-y-auto overflow-x-hidden'
         )}
       >
@@ -282,7 +282,7 @@ export function SettingsSidebar({
         (!isHosted && isLoadingSSO)
           ? SKELETON_SECTIONS.map((count, i) => (
               <div key={i} className='flex flex-shrink-0 flex-col'>
-                <div className='sidebar-collapse-hide px-4 pb-1.5'>
+                <div className='sidebar-collapse-hide px-4 pb-2'>
                   <Skeleton className='h-[14px] w-[64px] rounded-sm' />
                 </div>
                 <div className='flex flex-col gap-0.5 px-2'>
@@ -301,8 +301,8 @@ export function SettingsSidebar({
 
               return (
                 <div key={key} className='flex flex-shrink-0 flex-col'>
-                  <div className='px-4 pb-1.5'>
-                    <div className='font-base text-[var(--text-icon)] text-small'>{title}</div>
+                  <div className='px-4 pb-2'>
+                    <div className='font-base text-[var(--text-muted)] text-small'>{title}</div>
                   </div>
                   <div className='flex flex-col gap-0.5 px-2'>
                     {sectionItems.map((item) => {
@@ -311,7 +311,7 @@ export function SettingsSidebar({
                       const isLocked = item.requiresMax && !subscriptionAccess.hasUsableMaxAccess
                       const itemClassName = cn(
                         'group mx-0.5 flex h-[30px] items-center gap-2 rounded-[8px] px-2 text-[14px]',
-                        !active && 'hover-hover:bg-[var(--surface-hover)]',
+                        !active && 'hover-hover:bg-[var(--surface-active)]',
                         active && 'bg-[var(--surface-active)]'
                       )
                       const content = (

@@ -42,7 +42,6 @@ import { useWorkflowStore } from '@/stores/workflows/workflow/store'
 interface WorkflowItemProps {
   workflow: WorkflowMetadata
   active: boolean
-  level: number
   dragDisabled?: boolean
   onWorkflowClick: (workflowId: string, shiftKey: boolean) => void
   onDragStart?: () => void
@@ -59,7 +58,6 @@ interface WorkflowItemProps {
 export function WorkflowItem({
   workflow,
   active,
-  level,
   dragDisabled = false,
   onWorkflowClick,
   onDragStart: onDragStartProp,
@@ -427,7 +425,7 @@ export function WorkflowItem({
             !isContextMenuOpen &&
             !(isSelected && selectedWorkflows.size > 1) &&
             !isAnyDragActive &&
-            'hover-hover:bg-[var(--surface-hover)]',
+            'hover-hover:bg-[var(--surface-active)]',
           (isDragging || (isAnyDragActive && isSelected)) && 'opacity-50'
         )}
         draggable={!isEditing && !dragDisabled}

@@ -94,33 +94,15 @@ function FlyoutMoreButton({
   )
 }
 
-function TaskStatusIcon({
-  isActive,
-  isUnread,
-  hideStatusOnHover = false,
-}: {
-  isActive?: boolean
-  isUnread?: boolean
-  hideStatusOnHover?: boolean
-}) {
+function TaskStatusIcon({ isActive, isUnread }: { isActive?: boolean; isUnread?: boolean }) {
   return (
     <span className='relative flex-shrink-0'>
       <Blimp className='h-[16px] w-[16px] text-[var(--text-icon)]' />
       {isActive && (
-        <span
-          className={cn(
-            '-right-[1px] -bottom-[1px] absolute h-[6px] w-[6px] rounded-full border border-[var(--surface-1)] bg-amber-400',
-            hideStatusOnHover && 'group-hover:hidden'
-          )}
-        />
+        <span className='-right-[1px] -bottom-[1px] absolute h-[6px] w-[6px] rounded-full border border-[var(--surface-1)] bg-amber-400' />
       )}
       {!isActive && isUnread && (
-        <span
-          className={cn(
-            '-right-[1px] -bottom-[1px] absolute h-[6px] w-[6px] rounded-full border border-[var(--surface-1)] bg-[var(--indicator-online)]',
-            hideStatusOnHover && 'group-hover:hidden'
-          )}
-        />
+        <span className='-right-[1px] -bottom-[1px] absolute h-[6px] w-[6px] rounded-full border border-[var(--surface-1)] bg-[var(--indicator-online)]' />
       )}
     </span>
   )
@@ -162,7 +144,7 @@ export function CollapsedSidebarMenu({
             <button
               type='button'
               aria-label={ariaLabel}
-              className='mx-0.5 flex h-[30px] items-center rounded-lg px-2 hover-hover:bg-[var(--surface-hover)]'
+              className='mx-0.5 flex h-[30px] items-center rounded-lg px-2 hover-hover:bg-[var(--surface-active)]'
             >
               {icon}
             </button>
@@ -235,7 +217,7 @@ export function CollapsedTaskFlyoutItem({
         href={task.href}
         className={cn(
           'flex min-w-0 cursor-default select-none items-center rounded-[5px] px-2 py-2 pr-[30px] font-medium text-[var(--text-body)] text-caption outline-none transition-colors',
-          !(isCurrentRoute || isMenuOpen) && 'group-hover:bg-[var(--surface-hover)]',
+          !(isCurrentRoute || isMenuOpen) && 'group-hover:bg-[var(--surface-active)]',
           (isCurrentRoute || isMenuOpen) && 'bg-[var(--surface-active)]'
         )}
         onContextMenu={
@@ -317,7 +299,7 @@ export function CollapsedWorkflowFlyoutItem({
         href={href}
         className={cn(
           'flex min-w-0 cursor-default select-none items-center gap-2 rounded-[5px] px-2 py-2 pr-[30px] font-medium text-[var(--text-body)] text-caption outline-none transition-colors',
-          !(isCurrentRoute || actionsOpen) && 'group-hover:bg-[var(--surface-hover)]',
+          !(isCurrentRoute || actionsOpen) && 'group-hover:bg-[var(--surface-active)]',
           (isCurrentRoute || actionsOpen) && 'bg-[var(--surface-active)]'
         )}
         onContextMenu={
@@ -424,7 +406,7 @@ export function CollapsedFolderItems({
 
         return (
           <DropdownMenuSub key={folder.id}>
-            <DropdownMenuSubTrigger className='focus:bg-[var(--surface-hover)] data-[state=open]:bg-[var(--surface-hover)]'>
+            <DropdownMenuSubTrigger className='focus:bg-[var(--surface-active)] data-[state=open]:bg-[var(--surface-active)]'>
               <Folder className='h-[14px] w-[14px]' />
               <span className='truncate'>{folder.name}</span>
             </DropdownMenuSubTrigger>

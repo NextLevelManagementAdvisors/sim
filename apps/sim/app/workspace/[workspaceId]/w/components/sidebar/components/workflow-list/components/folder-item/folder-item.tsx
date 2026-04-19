@@ -45,7 +45,6 @@ const logger = createLogger('FolderItem')
 
 interface FolderItemProps {
   folder: FolderTreeNode
-  level: number
   dragDisabled?: boolean
   hoverHandlers?: {
     onDragEnter?: (e: React.DragEvent<HTMLElement>) => void
@@ -58,7 +57,6 @@ interface FolderItemProps {
 
 export function FolderItem({
   folder,
-  level,
   dragDisabled = false,
   hoverHandlers,
   onFolderClick,
@@ -472,7 +470,7 @@ export function FolderItem({
           !isSelected &&
             !isContextMenuOpen &&
             !isAnyDragActive &&
-            'hover-hover:bg-[var(--surface-hover)]',
+            'hover-hover:bg-[var(--surface-active)]',
           (isSelected || isContextMenuOpen) && 'bg-[var(--surface-active)]',
           (isDragging || (isAnyDragActive && isSelected)) && 'opacity-50'
         )}
