@@ -57,7 +57,7 @@ export const GROUP_HEADING_CLASSNAME =
   '[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:pb-1.5 [&_[cmdk-group-heading]]:font-base [&_[cmdk-group-heading]]:text-small [&_[cmdk-group-heading]]:text-[var(--text-icon)]'
 
 export const COMMAND_ITEM_CLASSNAME =
-  'group flex h-[30px] w-full cursor-pointer items-center gap-2 rounded-[8px] border border-transparent mx-0.5 px-2 text-left text-sm aria-selected:border-[var(--border-1)] aria-selected:bg-[var(--surface-active)] data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50'
+  'group mx-0.5 flex h-[30px] w-full cursor-pointer items-center gap-2 rounded-lg border border-transparent px-2 text-left text-sm aria-selected:border-[var(--border-1)] aria-selected:bg-[var(--surface-active)] data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50'
 
 function scoreMatch(value: string, search: string): number {
   if (!search) return 1

@@ -17,6 +17,7 @@ import {
   Duplicate,
   Eye,
   FolderPlus,
+  ImageUp,
   Lock,
   LogOut,
   Mail,
@@ -27,7 +28,6 @@ import {
   Trash,
   Unlock,
   Upload,
-  X,
 } from '@/components/emcn/icons'
 import { cn } from '@/lib/core/utils/cn'
 import { WORKFLOW_COLORS } from '@/lib/workflows/colors'
@@ -269,11 +269,8 @@ interface ContextMenuProps {
   isLocked?: boolean
   showDelete?: boolean
   onUploadLogo?: () => void
-  onRemoveLogo?: () => void
   showUploadLogo?: boolean
-  showRemoveLogo?: boolean
   disableUploadLogo?: boolean
-  disableRemoveLogo?: boolean
 }
 
 /**
@@ -323,11 +320,8 @@ export function ContextMenu({
   isLocked = false,
   showDelete = true,
   onUploadLogo,
-  onRemoveLogo,
   showUploadLogo = false,
-  showRemoveLogo = false,
   disableUploadLogo = false,
-  disableRemoveLogo = false,
 }: ContextMenuProps) {
   const [hexInput, setHexInput] = useState(currentColor || '#ffffff')
 
@@ -382,8 +376,7 @@ export function ContextMenu({
     (showCreateFolder && onCreateFolder) ||
     (showColorChange && onColorChange) ||
     (showLock && onToggleLock) ||
-    (showUploadLogo && onUploadLogo) ||
-    (showRemoveLogo && onRemoveLogo)
+    (showUploadLogo && onUploadLogo)
   const hasCopySection = (showDuplicate && onDuplicate) || (showExport && onExport)
 
   return (
@@ -507,23 +500,10 @@ export function ContextMenu({
               onClose()
             }}
           >
-            <Upload />
+            <ImageUp />
             Upload logo
           </DropdownMenuItem>
         )}
-        {showRemoveLogo && onRemoveLogo && (
-          <DropdownMenuItem
-            disabled={disableRemoveLogo}
-            onSelect={() => {
-              onRemoveLogo()
-              onClose()
-            }}
-          >
-            <X />
-            Remove logo
-          </DropdownMenuItem>
-        )}
-
         {showLock && onToggleLock && (
           <DropdownMenuItem
             disabled={disableLock}

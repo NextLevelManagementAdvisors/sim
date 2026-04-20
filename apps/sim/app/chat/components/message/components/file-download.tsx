@@ -3,8 +3,8 @@
 import { useState } from 'react'
 import { createLogger } from '@sim/logger'
 import { sleep } from '@sim/utils/helpers'
-import { ArrowDown, Download, Loader2, Music } from 'lucide-react'
-import { Button } from '@/components/emcn'
+import { Loader2, Music } from 'lucide-react'
+import { Button, Upload } from '@/components/emcn'
 import { DefaultFileIcon, getDocumentIcon } from '@/components/icons/document-icons'
 import type { ChatFile } from '@/app/chat/components/message/message'
 
@@ -128,7 +128,7 @@ export function ChatFileDownload({ file }: ChatFileDownloadProps) {
         {isDownloading ? (
           <Loader2 className='h-3.5 w-3.5 animate-spin' />
         ) : (
-          <ArrowDown
+          <Upload
             className={`h-3.5 w-3.5 transition-opacity ${isHovered ? 'opacity-100' : 'opacity-0'}`}
           />
         )}
@@ -178,7 +178,7 @@ export function ChatFileDownloadAll({ files }: ChatFileDownloadAllProps) {
       {isDownloading ? (
         <Loader2 className='h-3 w-3 animate-spin' strokeWidth={2} />
       ) : (
-        <Download className='h-3 w-3' strokeWidth={2} />
+        <Upload className='h-3 w-3' strokeWidth={2} />
       )}
     </button>
   )

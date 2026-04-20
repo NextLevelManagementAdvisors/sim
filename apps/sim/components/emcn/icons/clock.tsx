@@ -1,10 +1,10 @@
 import type { SVGProps } from 'react'
 
 /**
- * Duplicate icon component - two overlapping rounded rectangles
+ * Clock icon component - circular clock face with hour and minute hands
  * @param props - SVG properties including className, fill, etc.
  */
-export function Duplicate(props: SVGProps<SVGSVGElement>) {
+export function Clock(props: SVGProps<SVGSVGElement>) {
   return (
     <svg
       width='24'
@@ -19,8 +19,8 @@ export function Duplicate(props: SVGProps<SVGSVGElement>) {
       aria-hidden='true'
       {...props}
     >
-      <path d='M14.25 0.75H2.75C1.64543 0.75 0.75 1.64543 0.75 2.75V14.25' />
-      <rect x='5.25' y='5.25' width='14' height='14' rx='2' />
+      <circle cx='10.25' cy='9.75' r='9' />
+      <path d='M10.25 4.75V9.75L13.75 12.25' />
     </svg>
   )
 }

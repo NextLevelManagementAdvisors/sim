@@ -23,9 +23,9 @@ import {
 } from '@/components/emcn'
 import {
   BookOpen,
-  Calendar,
+  Clock,
   Database,
-  File,
+  Files,
   HelpCircle,
   PanelLeft,
   Plus,
@@ -56,6 +56,10 @@ import {
 } from '@/app/workspace/[workspaceId]/w/components/sidebar/components'
 import { ContextMenu } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/context-menu/context-menu'
 import { DeleteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workflow-list/components/delete-modal/delete-modal'
+import {
+  SIDEBAR_ITEM_GAP_CLASS,
+  SIDEBAR_SECTION_GAP_CLASS,
+} from '@/app/workspace/[workspaceId]/w/components/sidebar/constants'
 import {
   useContextMenu,
   useFlyoutInlineRename,
@@ -711,7 +715,7 @@ export const Sidebar = memo(function Sidebar() {
         {
           id: 'files',
           label: 'Files',
-          icon: File,
+          icon: Files,
           href: `/workspace/${workspaceId}/files`,
           hidden: permissionConfig.hideFilesTab,
         },
@@ -725,7 +729,7 @@ export const Sidebar = memo(function Sidebar() {
         {
           id: 'scheduled-tasks',
           label: 'Scheduled Tasks',
-          icon: Calendar,
+          icon: Clock,
           href: `/workspace/${workspaceId}/scheduled-tasks`,
         },
         {
@@ -1048,13 +1052,6 @@ export const Sidebar = memo(function Sidebar() {
     [updateWorkspace]
   )
 
-  const handleColorChangeWorkspace = useCallback(
-    async (workspaceIdToUpdate: string, color: string) => {
-      await updateWorkspace(workspaceIdToUpdate, { color })
-    },
-    [updateWorkspace]
-  )
-
   const handleUploadLogo = useCallback(
     (workspaceIdToUpdate: string) => {
       logoTargetWorkspaceIdRef.current = workspaceIdToUpdate
@@ -1062,13 +1059,6 @@ export const Sidebar = memo(function Sidebar() {
       logoFileInputRef.current?.click()
     },
     [logoFileInputRef, setLogoTargetWorkspaceId]
-  )
-
-  const handleRemoveLogo = useCallback(
-    async (workspaceIdToUpdate: string) => {
-      await updateWorkspace(workspaceIdToUpdate, { logoUrl: null })
-    },
-    [updateWorkspace]
   )
 
   const handleDeleteWorkspace = useCallback(
@@ -1298,9 +1288,7 @@ export const Sidebar = memo(function Sidebar() {
                 isDeletingWorkspace={isDeletingWorkspace}
                 onDuplicateWorkspace={handleDuplicateWorkspace}
                 onExportWorkspace={exportWorkspace}
-                onColorChange={handleColorChangeWorkspace}
                 onUploadLogo={handleUploadLogo}
-                onRemoveLogo={handleRemoveLogo}
                 onLeaveWorkspace={handleLeaveWorkspaceWrapper}
                 isLeavingWorkspace={isLeavingWorkspace}
                 sessionUserId={sessionData?.user?.id}
@@ -1330,7 +1318,13 @@ export const Sidebar = memo(function Sidebar() {
               />
             ) : (
               <>
-                <div className='mt-3 flex flex-shrink-0 flex-col gap-0.5 px-2'>
+                <div
+                  className={cn(
+                    SIDEBAR_SECTION_GAP_CLASS,
+                    SIDEBAR_ITEM_GAP_CLASS,
+                    'flex flex-shrink-0 flex-col px-2'
+                  )}
+                >
                   {topNavItems.map((item) => (
                     <SidebarNavItem
                       key={item.id}
@@ -1342,11 +1336,13 @@ export const Sidebar = memo(function Sidebar() {
                   ))}
                 </div>
 
-                <div className='mt-3 flex flex-shrink-0 flex-col pb-1.5'>
+                <div
+                  className={cn(SIDEBAR_SECTION_GAP_CLASS, 'flex flex-shrink-0 flex-col pb-1.5')}
+                >
                   <div className='px-4 pb-2'>
                     <div className='font-base text-[var(--text-muted)] text-small'>Workspace</div>
                   </div>
-                  <div className='flex flex-col gap-0.5 px-2'>
+                  <div className={cn(SIDEBAR_ITEM_GAP_CLASS, 'flex flex-col px-2')}>
                     {workspaceNavItems.map((item) => (
                       <SidebarNavItem
                         key={item.id}
@@ -1426,7 +1422,7 @@ export const Sidebar = memo(function Sidebar() {
                           )}
                         </CollapsedSidebarMenu>
                       ) : (
-                        <div className='mt-2 flex flex-col gap-0.5 px-2'>
+                        <div className={cn(SIDEBAR_ITEM_GAP_CLASS, 'mt-2 flex flex-col px-2')}>
                           {tasksLoading ? (
                             <SidebarItemSkeleton />
                           ) : (
@@ -1488,7 +1484,12 @@ export const Sidebar = memo(function Sidebar() {
                       )}
                     </div>
 
-                    <div className='workflows-section relative mt-3.5 flex flex-col'>
+                    <div
+                      className={cn(
+                        SIDEBAR_SECTION_GAP_CLASS,
+                        'workflows-section relative flex flex-col'
+                      )}
+                    >
                       <div className='flex h-[18px] flex-shrink-0 items-center justify-between px-4'>
                         <div className='font-base text-[var(--text-muted)] text-small'>
                           Workflows
@@ -1647,7 +1648,8 @@ export const Sidebar = memo(function Sidebar() {
 
                 <div
                   className={cn(
-                    'flex flex-shrink-0 flex-col gap-0.5 border-t px-2 pt-[9px] pb-2 transition-colors duration-150',
+                    SIDEBAR_ITEM_GAP_CLASS,
+                    'flex flex-shrink-0 flex-col border-t px-2 pt-[9px] pb-2 transition-colors duration-150',
                     !hasOverflowBottom && 'border-transparent'
                   )}
                 >

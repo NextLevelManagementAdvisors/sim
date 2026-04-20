@@ -12,11 +12,11 @@ import {
   BubbleChatClose,
   BubbleChatPreview,
   Button,
-  Copy,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  Duplicate,
   Layout,
   Modal,
   ModalBody,
@@ -688,7 +688,7 @@ export const Panel = memo(function Panel({ workspaceId: propWorkspaceId }: Panel
                     onSelect={handleDuplicateWorkflow}
                     disabled={!userPermissions.canEdit || isDuplicating}
                   >
-                    <Copy animate={isDuplicating} />
+                    <Duplicate />
                     Duplicate workflow
                   </DropdownMenuItem>
                   <DropdownMenuItem

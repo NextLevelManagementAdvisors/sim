@@ -11,10 +11,10 @@ import {
   Combobox,
   type ComboboxOption,
   DatePicker,
-  Download,
   Library,
   RefreshCw,
   toast,
+  Upload,
 } from '@/components/emcn'
 import { dollarsToCredits } from '@/lib/billing/credits/conversion'
 import { cn } from '@/lib/core/utils/cn'
@@ -1119,7 +1119,7 @@ export default function Logs() {
     () => [
       {
         label: 'Export',
-        icon: Download,
+        icon: Upload,
         onClick: handleExport,
         disabled: !userPermissions.canEdit || isExporting || sortedLogs.length === 0,
       },

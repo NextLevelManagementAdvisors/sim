@@ -17,8 +17,8 @@ import {
   ModalFooter,
   ModalHeader,
   Plus,
+  Send,
   Skeleton,
-  UserPlus,
 } from '@/components/emcn'
 import { PanelLeft } from '@/components/emcn/icons'
 import { cn } from '@/lib/core/utils/cn'
@@ -27,7 +27,6 @@ import { DeleteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/
 import { CreateWorkspaceModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/create-workspace-modal/create-workspace-modal'
 import { InviteModal } from '@/app/workspace/[workspaceId]/w/components/sidebar/components/workspace-header/components/invite-modal'
 import type { Workspace, WorkspaceCreationPolicy } from '@/hooks/queries/workspace'
-import { usePermissionConfig } from '@/hooks/use-permission-config'
 
 const logger = createLogger('WorkspaceHeader')
 
@@ -64,12 +63,8 @@ interface WorkspaceHeaderProps {
   onDuplicateWorkspace: (workspaceId: string, workspaceName: string) => Promise<void>
   /** Callback to export the workspace */
   onExportWorkspace: (workspaceId: string, workspaceName: string) => Promise<void>
-  /** Callback to change the workspace color */
-  onColorChange: (workspaceId: string, color: string) => Promise<void>
   /** Callback to upload a workspace logo */
   onUploadLogo: (workspaceId: string) => void
-  /** Callback to remove the workspace logo */
-  onRemoveLogo: (workspaceId: string) => Promise<void>
   /** Callback to leave the workspace */
   onLeaveWorkspace: (workspaceId: string) => Promise<void>
   /** Whether workspace leave is in progress */
@@ -102,9 +97,7 @@ function WorkspaceHeaderImpl({
   isDeletingWorkspace,
   onDuplicateWorkspace,
   onExportWorkspace,
-  onColorChange,
   onUploadLogo,
-  onRemoveLogo,
   onLeaveWorkspace,
   isLeavingWorkspace,
   sessionUserId,
@@ -141,6 +134,7 @@ function WorkspaceHeaderImpl({
   const createWorkspaceDisabledReason =
     workspaceCreationPolicy?.canCreate === false ? workspaceCreationPolicy.reason : null
   const inviteDisabledReason = activeWorkspaceFull?.inviteDisabledReason ?? null
+  const isInvitationsDisabled = inviteDisabledReason !== null
 
   useEffect(() => {
     const handleOpenInvite = () => {
@@ -273,22 +267,9 @@ function WorkspaceHeaderImpl({
     }
   }
 
-  /**
-   * Handles color change action from context menu
-   */
-  const handleColorChangeAction = async (color: string) => {
-    if (!capturedWorkspaceRef.current) return
-    await onColorChange(capturedWorkspaceRef.current.id, color)
-  }
-
   const handleUploadLogoAction = () => {
     if (!capturedWorkspaceRef.current) return
     onUploadLogo(capturedWorkspaceRef.current.id)
-  }
-
-  const handleRemoveLogoAction = async () => {
-    if (!capturedWorkspaceRef.current) return
-    await onRemoveLogo(capturedWorkspaceRef.current.id)
   }
 
   /**
@@ -420,7 +401,7 @@ function WorkspaceHeaderImpl({
             align='start'
             side={isCollapsed ? 'right' : 'bottom'}
             sideOffset={isCollapsed ? 16 : 8}
-            className='flex max-h-none flex-col overflow-hidden rounded-xl'
+            className='flex max-h-none flex-col overflow-hidden rounded-2xl'
             style={{
               width: '248px',
               maxWidth: 'calc(100vw - 24px)',
@@ -619,7 +600,7 @@ function WorkspaceHeaderImpl({
                         setIsWorkspaceMenuOpen(false)
                       }}
                     >
-                      <UserPlus className='h-[14px] w-[14px] shrink-0 text-[var(--text-icon)]' />
+                      <Send className='h-[14px] w-[14px] shrink-0 text-[var(--text-icon)]' />
                       Invite members
                     </button>
                   </>
@@ -686,24 +667,17 @@ function WorkspaceHeaderImpl({
             onExport={handleExportAction}
             onDelete={handleDeleteAction}
             onLeave={handleLeaveAction}
-            onColorChange={handleColorChangeAction}
             onUploadLogo={handleUploadLogoAction}
-            onRemoveLogo={handleRemoveLogoAction}
-            currentColor={capturedWorkspace?.color}
             showRename={true}
             showDuplicate={true}
             showExport={true}
-            showColorChange={true}
             showUploadLogo={true}
-            showRemoveLogo={!!capturedWorkspace?.logoUrl}
             showLeave={!isOwner}
             disableRename={!contextCanAdmin}
             disableDuplicate={!contextCanEdit}
             disableExport={!contextCanAdmin}
             disableDelete={!contextCanAdmin || workspaces.length <= 1}
-            disableColorChange={!contextCanAdmin}
             disableUploadLogo={!contextCanAdmin}
-            disableRemoveLogo={!contextCanAdmin}
           />
         )
       })()}

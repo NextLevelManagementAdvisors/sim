@@ -19,9 +19,9 @@ export function Upload(props: SVGProps<SVGSVGElement>) {
       aria-hidden='true'
       {...props}
     >
-      <path d='M10.25 14V3.5' />
-      <path d='M5.75 8L10.25 3.5L14.75 8' />
-      <path d='M3 17.5H17.5' />
+      <path d='M0.75 12.75V16.75C0.75 17.8546 1.64543 18.75 2.75 18.75H17.75C18.8546 18.75 19.75 17.8546 19.75 16.75V12.75' />
+      <path d='M10.25 14.75V1.75' />
+      <path d='M5.25 6.75L10.25 1.75L15.25 6.75' />
     </svg>
   )
 }

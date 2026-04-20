@@ -17,10 +17,6 @@ import { getUserEntityPermissions } from '@/lib/workspaces/permissions/utils'
 
 const patchWorkspaceSchema = z.object({
   name: z.string().trim().min(1).optional(),
-  color: z
-    .string()
-    .regex(/^#[0-9a-fA-F]{6}$/)
-    .optional(),
   logoUrl: z
     .string()
     .refine((val) => val.startsWith('/') || val.startsWith('https://'), {
@@ -130,11 +126,10 @@ export const PATCH = withRouteHandler(
 
     try {
       const body = patchWorkspaceSchema.parse(await request.json())
-      const { name, color, logoUrl, billedAccountUserId, allowPersonalApiKeys } = body
+      const { name, logoUrl, billedAccountUserId, allowPersonalApiKeys } = body
 
       if (
         name === undefined &&
-        color === undefined &&
         logoUrl === undefined &&
         billedAccountUserId === undefined &&
         allowPersonalApiKeys === undefined
@@ -156,10 +151,6 @@ export const PATCH = withRouteHandler(
 
       if (name !== undefined) {
         updateData.name = name
-      }
-
-      if (color !== undefined) {
-        updateData.color = color
       }
 
       if (logoUrl !== undefined) {
@@ -254,7 +245,6 @@ export const PATCH = withRouteHandler(
         metadata: {
           changes: {
             ...(name !== undefined && { name: { from: existingWorkspace.name, to: name } }),
-            ...(color !== undefined && { color: { from: existingWorkspace.color, to: color } }),
             ...(logoUrl !== undefined && {
               logoUrl: { from: existingWorkspace.logoUrl, to: logoUrl },
             }),

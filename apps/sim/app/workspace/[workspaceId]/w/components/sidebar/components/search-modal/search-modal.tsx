@@ -11,6 +11,11 @@ import { Search } from '@/components/emcn/icons/search'
 import { cn } from '@/lib/core/utils/cn'
 import { captureEvent } from '@/lib/posthog/client'
 import { hasTriggerCapability } from '@/lib/workflows/triggers/trigger-utils'
+import {
+  CMDK_ITEM_GAP_CLASS,
+  CMDK_SECTION_GAP_CLASS,
+  SIDEBAR_SECTION_GAP_CLASS,
+} from '@/app/workspace/[workspaceId]/w/components/sidebar/constants'
 import { SIDEBAR_SCROLL_EVENT } from '@/app/workspace/[workspaceId]/w/components/sidebar/sidebar'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
@@ -439,7 +444,7 @@ export function SearchModal({
         aria-hidden={!open}
         aria-label='Search'
         className={cn(
-          '-translate-x-1/2 fixed top-[15%] z-50 w-[500px] rounded-xl border-none bg-[var(--bg)] shadow-2xl ring-4 ring-[color-mix(in_srgb,var(--surface-5)_80%,transparent)] dark:ring-[color-mix(in_srgb,var(--surface-4)_80%,transparent)]',
+          '-translate-x-1/2 fixed top-[15%] z-50 w-[500px] rounded-2xl border border-[var(--border-muted)] bg-[var(--surface-4)] p-[3px] shadow-[var(--shadow-overlay)] dark:bg-[var(--surface-5)]',
           open ? 'visible opacity-100' : 'invisible opacity-0'
         )}
         style={{
@@ -448,36 +453,45 @@ export function SearchModal({
             : 'calc(var(--sidebar-width) / 2 + 50%)',
         }}
       >
-        <Command label='Search' shouldFilter={false}>
-          <div className='mx-2 mt-2 flex items-center gap-1.5 rounded-lg border border-[var(--border-1)] bg-[var(--surface-5)] px-2 dark:bg-[var(--surface-4)]'>
-            <Search className='h-[14px] w-[14px] flex-shrink-0 text-[var(--text-muted)]' />
-            <Command.Input
-              ref={inputRef}
-              autoFocus
-              onValueChange={handleSearchChange}
-              placeholder='Search anything...'
-              className='w-full bg-transparent py-1.5 font-base text-[var(--text-primary)] text-sm outline-none placeholder:text-[var(--text-muted)] focus:outline-none'
-            />
-          </div>
-          <Command.List className='scrollbar-thin scrollbar-thumb-border scrollbar-track-transparent max-h-[400px] overflow-y-auto overflow-x-hidden p-2 [&_[cmdk-group-items]]:flex [&_[cmdk-group-items]]:flex-col [&_[cmdk-group-items]]:gap-0.5 [&_[cmdk-group]+[cmdk-group]]:mt-3.5'>
-            <Command.Empty className='flex items-center justify-center px-4 py-6 text-[var(--text-subtle)] text-sm'>
-              No results found.
-            </Command.Empty>
+        <div className='overflow-hidden rounded-xl border border-[var(--border-1)] bg-[var(--bg)]'>
+          <Command label='Search' shouldFilter={false}>
+            <div className='mx-2 mt-2 flex h-[30px] items-center gap-1.5 rounded-lg border border-[var(--border-1)] bg-[var(--surface-5)] px-2 dark:bg-[var(--surface-4)]'>
+              <Search className='h-[14px] w-[14px] flex-shrink-0 text-[var(--text-muted)]' />
+              <Command.Input
+                ref={inputRef}
+                autoFocus
+                onValueChange={handleSearchChange}
+                placeholder='Search anything...'
+                className='h-full w-full bg-transparent font-base text-[var(--text-body)] text-sm outline-none placeholder:text-[var(--text-muted)] focus:outline-none'
+              />
+            </div>
+            <Command.List
+              className={cn(
+                'scrollbar-thin scrollbar-thumb-border scrollbar-track-transparent max-h-[400px] overflow-y-auto overflow-x-hidden px-2 pb-2 [&_[cmdk-group-items]]:flex [&_[cmdk-group-items]]:flex-col',
+                CMDK_ITEM_GAP_CLASS,
+                CMDK_SECTION_GAP_CLASS,
+                SIDEBAR_SECTION_GAP_CLASS
+              )}
+            >
+              <Command.Empty className='flex items-center justify-center px-4 py-6 text-[var(--text-subtle)] text-sm'>
+                No results found.
+              </Command.Empty>
 
-            <BlocksGroup items={filteredBlocks} onSelect={handleBlockSelectAsBlock} />
-            <ToolsGroup items={filteredTools} onSelect={handleBlockSelectAsTool} />
-            <TriggersGroup items={filteredTriggers} onSelect={handleBlockSelectAsTrigger} />
-            <WorkflowsGroup items={filteredWorkflows} onSelect={handleWorkflowSelect} />
-            <TasksGroup items={filteredTasks} onSelect={handleTaskSelect} />
-            <TablesGroup items={filteredTables} onSelect={handleTableSelect} />
-            <FilesGroup items={filteredFiles} onSelect={handleFileSelect} />
-            <KnowledgeBasesGroup items={filteredKnowledgeBases} onSelect={handleKbSelect} />
-            <ToolOpsGroup items={filteredToolOps} onSelect={handleToolOperationSelect} />
-            <WorkspacesGroup items={filteredWorkspaces} onSelect={handleWorkspaceSelect} />
-            <DocsGroup items={filteredDocs} onSelect={handleDocSelect} />
-            <PagesGroup items={filteredPages} onSelect={handlePageSelect} />
-          </Command.List>
-        </Command>
+              <BlocksGroup items={filteredBlocks} onSelect={handleBlockSelectAsBlock} />
+              <ToolsGroup items={filteredTools} onSelect={handleBlockSelectAsTool} />
+              <TriggersGroup items={filteredTriggers} onSelect={handleBlockSelectAsTrigger} />
+              <WorkflowsGroup items={filteredWorkflows} onSelect={handleWorkflowSelect} />
+              <TasksGroup items={filteredTasks} onSelect={handleTaskSelect} />
+              <TablesGroup items={filteredTables} onSelect={handleTableSelect} />
+              <FilesGroup items={filteredFiles} onSelect={handleFileSelect} />
+              <KnowledgeBasesGroup items={filteredKnowledgeBases} onSelect={handleKbSelect} />
+              <ToolOpsGroup items={filteredToolOps} onSelect={handleToolOperationSelect} />
+              <WorkspacesGroup items={filteredWorkspaces} onSelect={handleWorkspaceSelect} />
+              <DocsGroup items={filteredDocs} onSelect={handleDocSelect} />
+              <PagesGroup items={filteredPages} onSelect={handlePageSelect} />
+            </Command.List>
+          </Command>
+        </div>
       </div>
     </>,
     document.body

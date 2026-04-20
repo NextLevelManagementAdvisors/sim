@@ -1,10 +1,12 @@
 import type { SVGProps } from 'react'
 
 /**
- * Duplicate icon component - two overlapping rounded rectangles
+ * ImageUp icon component - picture frame with sun and mountain silhouette.
+ * Universal "image" glyph used for actions that set or upload an image
+ * (e.g., workspace logo).
  * @param props - SVG properties including className, fill, etc.
  */
-export function Duplicate(props: SVGProps<SVGSVGElement>) {
+export function ImageUp(props: SVGProps<SVGSVGElement>) {
   return (
     <svg
       width='24'
@@ -19,8 +21,9 @@ export function Duplicate(props: SVGProps<SVGSVGElement>) {
       aria-hidden='true'
       {...props}
     >
-      <path d='M14.25 0.75H2.75C1.64543 0.75 0.75 1.64543 0.75 2.75V14.25' />
-      <rect x='5.25' y='5.25' width='14' height='14' rx='2' />
+      <rect x='0.75' y='0.75' width='18.5' height='18' rx='2.5' />
+      <circle cx='6.25' cy='6.25' r='1.75' />
+      <path d='M17.25 12.75L12.25 7.75L2.75 17.25' />
     </svg>
   )
 }

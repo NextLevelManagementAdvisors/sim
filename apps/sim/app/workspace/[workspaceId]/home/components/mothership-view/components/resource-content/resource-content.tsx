@@ -5,9 +5,8 @@ import { createLogger } from '@sim/logger'
 import { formatDuration } from '@sim/utils/formatting'
 import { Square } from 'lucide-react'
 import { useRouter } from 'next/navigation'
-import { Button, Eye, PlayOutline, Skeleton, Tooltip } from '@/components/emcn'
+import { Button, Eye, PlayOutline, Skeleton, Tooltip, Upload } from '@/components/emcn'
 import {
-  Download,
   FileX,
   Folder as FolderIcon,
   Library,
@@ -404,7 +403,7 @@ function EmbeddedFileActions({ workspaceId, fileId }: EmbeddedFileActionsProps) 
             className={RESOURCE_TAB_ICON_BUTTON_CLASS}
             aria-label='Download file'
           >
-            <Download className={RESOURCE_TAB_ICON_CLASS} />
+            <Upload className={RESOURCE_TAB_ICON_CLASS} />
           </Button>
         </Tooltip.Trigger>
         <Tooltip.Content side='bottom'>

@@ -5,11 +5,11 @@ import { useRef, useState } from 'react'
 import { AlertCircle, Loader2 } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import {
-  Copy,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  Duplicate,
   Modal,
   ModalBody,
   ModalContent,
@@ -192,7 +192,7 @@ export function ExecutionSnapshot({
               onCloseAutoFocus={(e) => e.preventDefault()}
             >
               <DropdownMenuItem onSelect={handleCopyExecutionId}>
-                <Copy />
+                <Duplicate />
                 Copy Run ID
               </DropdownMenuItem>
             </DropdownMenuContent>

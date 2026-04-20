@@ -6,7 +6,7 @@ import { useParams, useRouter } from 'next/navigation'
 import {
   Button,
   Check,
-  Copy,
+  Duplicate,
   Modal,
   ModalBody,
   ModalContent,
@@ -177,7 +177,7 @@ export const MessageActions = memo(function MessageActions({
                 onClick={copyToClipboard}
                 className={BUTTON_CLASS}
               >
-                {copied ? <Check className={ICON_CLASS} /> : <Copy className={ICON_CLASS} />}
+                {copied ? <Check className={ICON_CLASS} /> : <Duplicate className={ICON_CLASS} />}
               </button>
             </Tooltip.Trigger>
             <Tooltip.Content side='top'>
@@ -254,7 +254,7 @@ export const MessageActions = memo(function MessageActions({
                         {copiedRequestId ? (
                           <Check className='h-[14px] w-[14px]' />
                         ) : (
-                          <Copy className='h-[14px] w-[14px]' />
+                          <Duplicate className='h-[14px] w-[14px]' />
                         )}
                       </button>
                     </Tooltip.Trigger>

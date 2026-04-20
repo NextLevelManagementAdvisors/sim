@@ -2,9 +2,9 @@
 
 import { useState } from 'react'
 import { createLogger } from '@sim/logger'
-import { ArrowDown, Loader2 } from 'lucide-react'
+import { Loader2 } from 'lucide-react'
 import { useRouter } from 'next/navigation'
-import { Button } from '@/components/emcn'
+import { Button, Upload } from '@/components/emcn'
 import { extractWorkspaceIdFromExecutionKey, getViewerUrl } from '@/lib/uploads/utils/file-utils'
 
 const logger = createLogger('FileCards')
@@ -120,7 +120,7 @@ function FileCard({ file, isExecutionFile = false, workspaceId }: FileCardProps)
           {isDownloading ? (
             <Loader2 className='mr-1 h-[10px] w-[10px] animate-spin' />
           ) : (
-            <ArrowDown className='mr-1 h-[10px] w-[10px]' />
+            <Upload className='mr-1 h-[10px] w-[10px]' />
           )}
           {isDownloading ? 'Opening...' : 'Download'}
         </Button>
@@ -227,7 +227,7 @@ export function FileDownload({
       {isDownloading ? (
         <Loader2 className='h-3 w-3 animate-spin' />
       ) : (
-        <ArrowDown className='h-[14px] w-[14px]' />
+        <Upload className='h-[14px] w-[14px]' />
       )}
       {isDownloading ? 'Downloading...' : 'Download'}
     </Button>

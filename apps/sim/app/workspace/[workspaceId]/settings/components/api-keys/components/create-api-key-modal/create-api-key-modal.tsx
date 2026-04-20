@@ -2,11 +2,12 @@
 
 import { useState } from 'react'
 import { createLogger } from '@sim/logger'
-import { Check, Copy } from 'lucide-react'
+import { Check } from 'lucide-react'
 import {
   Button,
   ButtonGroup,
   ButtonGroupItem,
+  Duplicate,
   Input as EmcnInput,
   Modal,
   ModalBody,
@@ -238,7 +239,7 @@ export function CreateApiKeyModal({
                   {copySuccess ? (
                     <Check className='h-[14px] w-[14px]' />
                   ) : (
-                    <Copy className='h-[14px] w-[14px]' />
+                    <Duplicate className='h-[14px] w-[14px]' />
                   )}
                   <span className='sr-only'>Copy to clipboard</span>
                 </Button>

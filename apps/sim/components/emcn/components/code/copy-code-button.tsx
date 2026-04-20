@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Button, Check, Copy } from '@/components/emcn'
+import { Button, Check, Duplicate } from '@/components/emcn'
 import { cn } from '@/lib/core/utils/cn'
 
 interface CopyCodeButtonProps {
@@ -36,7 +36,7 @@ export function CopyCodeButton({ code, className }: CopyCodeButtonProps) {
       onClick={handleCopy}
       className={cn('flex items-center gap-1 rounded px-1.5 py-0.5 text-xs', className)}
     >
-      {copied ? <Check className='size-3.5' /> : <Copy className='size-3.5' />}
+      {copied ? <Check className='size-3.5' /> : <Duplicate className='size-3.5' />}
     </Button>
   )
 }

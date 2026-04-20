@@ -4,9 +4,10 @@ import { useMemo, useState } from 'react'
 // import { useParams } from 'next/navigation'
 import { createLogger } from '@sim/logger'
 import { formatDate } from '@sim/utils/formatting'
-import { Check, Copy, Plus, Search } from 'lucide-react'
+import { Check, Plus, Search } from 'lucide-react'
 import {
   Button,
+  Duplicate,
   Input as EmcnInput,
   Modal,
   ModalBody,
@@ -17,7 +18,6 @@ import {
 } from '@/components/emcn'
 import { Input } from '@/components/ui'
 // import { useMcpServers, useUpdateMcpServer } from '@/hooks/queries/mcp'
-import { CopilotKeySkeleton } from '@/app/workspace/[workspaceId]/settings/components/copilot/copilot-skeleton'
 import {
   type CopilotKey,
   useCopilotKeys,
@@ -210,13 +210,7 @@ export function Copilot() {
 
         {/* Scrollable Content */}
         <div className='min-h-0 flex-1 overflow-y-auto'>
-          {isLoading ? (
-            <div className='flex flex-col gap-2'>
-              <CopilotKeySkeleton />
-              <CopilotKeySkeleton />
-              <CopilotKeySkeleton />
-            </div>
-          ) : showEmptyState ? (
+          {isLoading ? null : showEmptyState ? (
             <div className='flex h-full items-center justify-center text-[var(--text-muted)] text-sm'>
               Click "Create" above to get started
             </div>
@@ -345,7 +339,7 @@ export function Copilot() {
                   {copySuccess ? (
                     <Check className='h-[14px] w-[14px]' />
                   ) : (
-                    <Copy className='h-[14px] w-[14px]' />
+                    <Duplicate className='h-[14px] w-[14px]' />
                   )}
                   <span className='sr-only'>Copy to clipboard</span>
                 </Button>

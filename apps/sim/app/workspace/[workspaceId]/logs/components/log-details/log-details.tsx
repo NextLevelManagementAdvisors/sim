@@ -7,12 +7,12 @@ import { createPortal } from 'react-dom'
 import {
   Button,
   Code,
-  Copy as CopyIcon,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  Duplicate,
   Input,
   Redo,
   Search as SearchIcon,
@@ -236,7 +236,7 @@ export const WorkflowOutputSection = memo(
                 onCloseAutoFocus={(e) => e.preventDefault()}
               >
                 <DropdownMenuItem onSelect={handleCopy}>
-                  <CopyIcon />
+                  <Duplicate />
                   Copy
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />

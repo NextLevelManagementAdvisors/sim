@@ -18,7 +18,6 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
-  Skeleton,
   Textarea,
   Tooltip,
 } from '@/components/emcn'
@@ -35,7 +34,6 @@ import {
 import { getCanonicalScopesForProvider, getServiceConfigByProviderId } from '@/lib/oauth'
 import { getScopeDescription } from '@/lib/oauth/utils'
 import { getUserColor } from '@/lib/workspaces/colors'
-import { CredentialSkeleton } from '@/app/workspace/[workspaceId]/settings/components/credentials/credential-skeleton'
 import {
   useCreateCredentialDraft,
   useCreateWorkspaceCredential,
@@ -1300,12 +1298,7 @@ export function IntegrationsManager() {
               <div className='flex flex-col gap-1.5 border-[var(--border)] border-t pt-4'>
                 <Label>Members ({activeMembers.length})</Label>
 
-                {membersLoading ? (
-                  <div className='flex flex-col gap-2'>
-                    <Skeleton className='h-[44px] w-full rounded-lg' />
-                    <Skeleton className='h-[44px] w-full rounded-lg' />
-                  </div>
-                ) : (
+                {membersLoading ? null : (
                   <div className='flex flex-col gap-2'>
                     {activeMembers.map((member) => (
                       <div
@@ -1490,13 +1483,7 @@ export function IntegrationsManager() {
         </div>
 
         <div className='min-h-0 flex-1 overflow-y-auto'>
-          {credentialsLoading ? (
-            <div className='flex flex-col gap-2'>
-              <CredentialSkeleton />
-              <CredentialSkeleton />
-              <CredentialSkeleton />
-            </div>
-          ) : (
+          {credentialsLoading ? null : (
             <div className='flex flex-col gap-2'>
               {sortedCredentials.map((credential) => {
                 const serviceConfig = credential.providerId
