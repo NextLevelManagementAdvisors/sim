@@ -7,7 +7,23 @@ export function extractSessionDataFromAuthClientResult(result: unknown): unknown
 
   // Expected shape from better-auth client: { data: <session> }
   if ('data' in record) {
-    return (record as { data?: unknown }).data ?? null
+    const data = (record as { data?: unknown }).data
+
+    if (!data || typeof data !== 'object') {
+      return null
+    }
+
+    const dataRecord = data as Record<string, unknown>
+
+    if ('user' in dataRecord) {
+      return data
+    }
+
+    if ('data' in dataRecord) {
+      return dataRecord.data ?? null
+    }
+
+    return data
   }
 
   // Fallback for raw session payloads: { user, session }

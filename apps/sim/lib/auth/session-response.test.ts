@@ -19,6 +19,11 @@ describe('extractSessionDataFromAuthClientResult', () => {
     expect(extractSessionDataFromAuthClientResult({ data: session })).toEqual(session)
   })
 
+  it('unwraps disabled-auth get-session responses wrapped by the auth client', () => {
+    const session = { user: { id: 'u1' }, session: { id: 's1' } }
+    expect(extractSessionDataFromAuthClientResult({ data: { data: session } })).toEqual(session)
+  })
+
   it('falls back to raw session payload shape', () => {
     const raw = { user: { id: 'u1' }, session: { id: 's1' } }
     expect(extractSessionDataFromAuthClientResult(raw)).toEqual(raw)
