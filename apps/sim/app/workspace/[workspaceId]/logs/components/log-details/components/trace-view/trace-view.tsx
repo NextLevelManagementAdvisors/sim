@@ -4,6 +4,7 @@ import type React from 'react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { formatDuration } from '@sim/utils/formatting'
 import {
+  AlertCircle,
   ArrowDown,
   ArrowUp,
   Check,
@@ -45,7 +46,7 @@ import {
 } from '@/app/workspace/[workspaceId]/logs/components/log-details/utils'
 import { useCodeViewerFeatures } from '@/hooks/use-code-viewer'
 
-const DEFAULT_TREE_PANE_WIDTH = 360
+const DEFAULT_TREE_PANE_WIDTH = 280
 const MIN_TREE_PANE_WIDTH = 200
 const MAX_TREE_PANE_WIDTH = 600
 const INDENT_PX = 12
@@ -235,6 +236,29 @@ function collectMatchingIds(spans: TraceSpan[], query: string): Set<string> {
 }
 
 /**
+ * Returns the set of ids of spans that have an error or contain an errored
+ * descendant. Used to filter the tree to error branches only.
+ */
+function collectErrorIds(spans: TraceSpan[]): Set<string> {
+  const ids = new Set<string>()
+  const walk = (list: TraceSpan[]): boolean => {
+    let anyError = false
+    for (const span of list) {
+      const id = getSpanId(span)
+      const children = getDisplayChildren(span)
+      const childError = children.length > 0 ? walk(children) : false
+      if (hasErrorInTree(span) || childError) {
+        ids.add(id)
+        anyError = true
+      }
+    }
+    return anyError
+  }
+  walk(spans)
+  return ids
+}
+
+/**
  * Row in the tree pane. Renders the span icon, name, duration, a hover tooltip
  * with timing context, and a Gantt-style mini timeline bar below the row so the
  * span's position within the run is visible at a glance. Clicking selects the
@@ -369,7 +393,7 @@ const TraceTreeRow = memo(function TraceTreeRow({
         </span>
       </div>
       <div className='pt-[3px] pr-3.5 pb-[5px] pl-[14px]'>
-        <div className='relative h-[3px] w-full overflow-hidden rounded-full bg-[var(--border)]'>
+        <div className='relative h-[6px] w-full overflow-hidden rounded-full bg-[var(--border)]'>
           <div
             className='absolute h-full rounded-full'
             style={{
@@ -627,11 +651,13 @@ function DetailCodeSection({
 /**
  * A single label:value row in the metadata block of the detail pane.
  */
-function MetaRow({ label, value }: { label: string; value: string }) {
+function MetaRow({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <div className='flex items-center justify-between gap-2 font-medium text-caption'>
       <span className='flex-shrink-0 text-[var(--text-tertiary)]'>{label}</span>
-      <span className='min-w-0 truncate text-right text-[var(--text-secondary)]'>{value}</span>
+      <span className='min-w-0 truncate text-right text-[var(--text-secondary)]' title={title}>
+        {value}
+      </span>
     </div>
   )
 }
@@ -659,9 +685,21 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
   const startedAt = parseTime(span.startTime)
   const endedAt = parseTime(span.endTime)
 
-  const metaEntries: { label: string; value: string }[] = []
+  const metaEntries: { label: string; value: string; title?: string }[] = []
   metaEntries.push({ label: 'Type', value: span.type })
   metaEntries.push({ label: 'Duration', value: formatDuration(duration, { precision: 2 }) || '—' })
+  if (Number.isFinite(startedAt) && startedAt > 0)
+    metaEntries.push({
+      label: 'Started',
+      value: new Date(startedAt).toLocaleTimeString(),
+      title: new Date(startedAt).toISOString(),
+    })
+  if (Number.isFinite(endedAt) && endedAt > 0)
+    metaEntries.push({
+      label: 'Ended',
+      value: new Date(endedAt).toLocaleTimeString(),
+      title: new Date(endedAt).toISOString(),
+    })
   if (span.provider) metaEntries.push({ label: 'Provider', value: span.provider })
   if (span.model) metaEntries.push({ label: 'Model', value: span.model })
   if (span.finishReason) metaEntries.push({ label: 'Finish reason', value: span.finishReason })
@@ -732,7 +770,7 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
       {metaEntries.length > 0 && (
         <div className='flex flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-2 dark:bg-transparent'>
           {metaEntries.map((m) => (
-            <MetaRow key={m.label} label={m.label} value={m.value} />
+            <MetaRow key={m.label} label={m.label} value={m.value} title={m.title} />
           ))}
         </div>
       )}
@@ -764,17 +802,6 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
           isError
         />
       )}
-
-      {Number.isFinite(startedAt) && Number.isFinite(endedAt) && startedAt > 0 && endedAt > 0 && (
-        <div className='flex items-center justify-between font-medium text-[var(--text-tertiary)] text-caption'>
-          <span title={new Date(startedAt).toISOString()}>
-            Started {new Date(startedAt).toLocaleTimeString()}
-          </span>
-          <span title={new Date(endedAt).toISOString()}>
-            Ended {new Date(endedAt).toLocaleTimeString()}
-          </span>
-        </div>
-      )}
     </div>
   )
 })
@@ -787,7 +814,9 @@ const TraceDetailPane = memo(function TraceDetailPane({ span }: { span: TraceSpa
  */
 export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps) {
   const treeRef = useRef<HTMLDivElement>(null)
+  const filterInputRef = useRef<HTMLInputElement>(null)
   const [searchQuery, setSearchQuery] = useState('')
+  const [errorsOnly, setErrorsOnly] = useState(false)
   const [treePaneWidth, setTreePaneWidth] = useState(DEFAULT_TREE_PANE_WIDTH)
   const treePaneWidthRef = useRef(DEFAULT_TREE_PANE_WIDTH)
   treePaneWidthRef.current = treePaneWidth
@@ -870,11 +899,28 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
     [normalizedSpans, searchQuery]
   )
 
+  const errorIds = useMemo(
+    () => (errorsOnly ? collectErrorIds(normalizedSpans) : null),
+    [normalizedSpans, errorsOnly]
+  )
+
+  // When errors-only is toggled on, expand all error branches so leaf errors are visible.
+  useEffect(() => {
+    if (errorsOnly && errorIds) {
+      setExpandedNodes((prev) => {
+        const next = new Set(prev)
+        for (const id of errorIds) next.add(id)
+        return next
+      })
+    }
+  }, [errorsOnly, errorIds])
+
   const flatList = useMemo(() => {
-    const visible = flattenVisible(normalizedSpans, expandedNodes)
-    if (!matchingIds) return visible
-    return visible.filter((entry) => matchingIds.has(getSpanId(entry.span)))
-  }, [normalizedSpans, expandedNodes, matchingIds])
+    let result = flattenVisible(normalizedSpans, expandedNodes)
+    if (matchingIds) result = result.filter((entry) => matchingIds.has(getSpanId(entry.span)))
+    if (errorIds) result = result.filter((entry) => errorIds.has(getSpanId(entry.span)))
+    return result
+  }, [normalizedSpans, expandedNodes, matchingIds, errorIds])
 
   const selectedSpan = useMemo(
     () => findSpan(normalizedSpans, selectedId),
@@ -905,11 +951,29 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // Cmd+F / Ctrl+F always intercepts to focus the filter input.
+      if ((e.metaKey || e.ctrlKey) && e.key === 'f') {
+        e.preventDefault()
+        filterInputRef.current?.focus()
+        return
+      }
       // Ignore while typing in inputs / contentEditable (filter box, etc.).
       const target = e.target as HTMLElement | null
       if (target) {
         const tag = target.tagName
         if (tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable) return
+      }
+      // `/` focuses the filter input.
+      if (e.key === '/') {
+        e.preventDefault()
+        filterInputRef.current?.focus()
+        return
+      }
+      // `e` jumps to the first error span.
+      if ((e.key === 'e' || e.key === 'E') && firstErrorId) {
+        e.preventDefault()
+        setSelectedId(firstErrorId)
+        return
       }
       if (!selectedId) return
       const currentIndex = flatList.findIndex((entry) => getSpanId(entry.span) === selectedId)
@@ -948,7 +1012,7 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [flatList, selectedId, expandedNodes, handleToggleExpand])
+  }, [flatList, selectedId, expandedNodes, handleToggleExpand, firstErrorId])
 
   useEffect(() => {
     if (!selectedId || !treeRef.current) return
@@ -978,14 +1042,19 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
           {runStatus === 'error' ? 'Error' : 'Success'}
         </Badge>
         {firstErrorId && (
-          <Button
-            type='button'
-            variant='ghost'
-            size='sm'
-            onClick={() => setSelectedId(firstErrorId)}
-          >
-            Jump to error
-          </Button>
+          <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+              <Button
+                type='button'
+                variant='ghost'
+                size='sm'
+                onClick={() => setSelectedId(firstErrorId)}
+              >
+                Jump to error
+              </Button>
+            </Tooltip.Trigger>
+            <Tooltip.Content side='bottom'>Press E</Tooltip.Content>
+          </Tooltip.Root>
         )}
         <span className='flex-shrink-0 font-medium text-[var(--text-secondary)] text-caption tabular-nums'>
           {formatDuration(totalDuration, { precision: 2 }) || '—'}
@@ -1005,13 +1074,35 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
           <div className='relative'>
             <Search className='-translate-y-1/2 pointer-events-none absolute top-1/2 left-[7px] h-[11px] w-[11px] text-[var(--text-tertiary)]' />
             <Input
+              ref={filterInputRef}
               type='text'
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  setSearchQuery('')
+                  filterInputRef.current?.blur()
+                }
+              }}
               placeholder='Filter spans'
               className='h-[24px] w-[140px] pl-[22px] text-caption'
             />
           </div>
+          <Tooltip.Root>
+            <Tooltip.Trigger asChild>
+              <Button
+                type='button'
+                variant={errorsOnly ? 'active' : 'ghost'}
+                className='!p-1'
+                onClick={() => setErrorsOnly((v) => !v)}
+                aria-label='Show errors only'
+                aria-pressed={errorsOnly}
+              >
+                <AlertCircle className='h-[12px] w-[12px]' />
+              </Button>
+            </Tooltip.Trigger>
+            <Tooltip.Content side='top'>Errors only</Tooltip.Content>
+          </Tooltip.Root>
           <Tooltip.Root>
             <Tooltip.Trigger asChild>
               <Button
