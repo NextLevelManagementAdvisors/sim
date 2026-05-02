@@ -482,7 +482,14 @@ const STATIC_MARKDOWN_COMPONENTS = {
   pre: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
   'mermaid-diagram': ({ definition }: { definition?: string }) => {
     const isStreaming = useContext(MermaidStreamingCtx)
-    return <MermaidDiagram definition={definition ?? ''} isStreaming={isStreaming} />
+    return (
+      <MermaidDiagram
+        definition={definition ?? ''}
+        isStreaming={isStreaming}
+        zoomable
+        zoomClassName='h-[420px] rounded-lg'
+      />
+    )
   },
   p: ({ children }: { children?: React.ReactNode }) => (
     <p className='mb-3 break-words text-[14px] text-[var(--text-primary)] leading-[1.6] last:mb-0'>
@@ -619,12 +626,15 @@ const STATIC_MARKDOWN_COMPONENTS = {
   img: ({ src, alt }: React.ImgHTMLAttributes<HTMLImageElement>) => {
     const resolvedSrc = resolveSimFileUrl(typeof src === 'string' ? src : undefined)
     return (
-      <img
-        src={resolvedSrc}
-        alt={alt ?? ''}
-        className='my-3 max-w-full rounded-md'
-        loading='lazy'
-      />
+      <ZoomablePreview className='my-3 h-[360px] rounded-md' initialScale='fit'>
+        <img
+          src={resolvedSrc}
+          alt={alt ?? ''}
+          className='max-h-full max-w-full select-none object-contain'
+          draggable={false}
+          loading='lazy'
+        />
+      </ZoomablePreview>
     )
   },
   table: ({ children }: { children?: React.ReactNode }) => (
