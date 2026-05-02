@@ -467,7 +467,7 @@ function resolveSimFileUrl(src: string | undefined): string | undefined {
     if (seg1 === 'workspace' && seg3 === 'files' && fileId) {
       return `/api/files/view/${fileId}`
     }
-    // files/by-id/{uuid}/content — format used by Mothership when embedding workspace files
+    // files/by-id/{uuid}/content — canonical VFS path used by Mothership skills; treat as embed URL
     const [, s1, s2, byIdFileId, s4] = parts
     if (s1 === 'files' && s2 === 'by-id' && byIdFileId && s4 === 'content') {
       return `/api/files/view/${byIdFileId}`
