@@ -462,9 +462,15 @@ function resolveSimFileUrl(src: string | undefined): string | undefined {
   try {
     const parsed = new URL(src, 'http://placeholder')
     if (parsed.origin !== 'http://placeholder') return src
-    const [, seg1, , seg3, fileId] = parsed.pathname.split('/')
+    const parts = parsed.pathname.split('/')
+    const [, seg1, , seg3, fileId] = parts
     if (seg1 === 'workspace' && seg3 === 'files' && fileId) {
       return `/api/files/view/${fileId}`
+    }
+    // files/by-id/{uuid}/content — format used by Mothership when embedding workspace files
+    const [, s1, s2, byIdFileId, s4] = parts
+    if (s1 === 'files' && s2 === 'by-id' && byIdFileId && s4 === 'content') {
+      return `/api/files/view/${byIdFileId}`
     }
   } catch {
     // not a parseable URL
