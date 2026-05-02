@@ -271,6 +271,7 @@ const TraceTreeRow = memo(function TraceTreeRow({
   canExpand,
   onSelect,
   onToggleExpand,
+  onContextMenu,
   matchQuery,
   runStartMs,
   runTotalMs,
@@ -281,6 +282,7 @@ const TraceTreeRow = memo(function TraceTreeRow({
   canExpand: boolean
   onSelect: (id: string) => void
   onToggleExpand: (id: string) => void
+  onContextMenu: (e: React.MouseEvent, span: TraceSpan) => void
   matchQuery: string
   runStartMs: number
   runTotalMs: number
@@ -310,6 +312,7 @@ const TraceTreeRow = memo(function TraceTreeRow({
         isSelected ? 'bg-[var(--surface-3)]' : 'hover-hover:bg-[var(--surface-2)]'
       )}
       onClick={() => onSelect(id)}
+      onContextMenu={(e) => onContextMenu(e, span)}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
@@ -949,6 +952,23 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
     })
   }, [])
 
+  const [spanContextMenu, setSpanContextMenu] = useState<{
+    x: number
+    y: number
+    span: TraceSpan
+  } | null>(null)
+
+  const handleSpanContextMenu = useCallback((e: React.MouseEvent, span: TraceSpan) => {
+    e.preventDefault()
+    setSpanContextMenu({ x: e.clientX, y: e.clientY, span })
+  }, [])
+
+  const handleCopySpan = useCallback(() => {
+    if (!spanContextMenu) return
+    navigator.clipboard.writeText(JSON.stringify(spanContextMenu.span, null, 2))
+    setSpanContextMenu(null)
+  }, [spanContextMenu])
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       // Cmd+F / Ctrl+F always intercepts to focus the filter input.
@@ -1157,6 +1177,7 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
                 canExpand={canExpand}
                 onSelect={handleSelect}
                 onToggleExpand={handleToggleExpand}
+                onContextMenu={handleSpanContextMenu}
                 matchQuery={searchQuery}
                 runStartMs={runStartMs}
                 runTotalMs={totalDuration}
@@ -1181,6 +1202,42 @@ export const TraceView = memo(function TraceView({ traceSpans }: TraceViewProps)
           <TraceDetailPane span={selectedSpan} />
         </div>
       </div>
+      {typeof document !== 'undefined' &&
+        spanContextMenu &&
+        createPortal(
+          <DropdownMenu
+            open
+            onOpenChange={(open) => !open && setSpanContextMenu(null)}
+            modal={false}
+          >
+            <DropdownMenuTrigger asChild>
+              <div
+                style={{
+                  position: 'fixed',
+                  left: `${spanContextMenu.x}px`,
+                  top: `${spanContextMenu.y}px`,
+                  width: '1px',
+                  height: '1px',
+                  pointerEvents: 'none',
+                }}
+                tabIndex={-1}
+                aria-hidden
+              />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align='start'
+              side='bottom'
+              sideOffset={4}
+              onCloseAutoFocus={(e) => e.preventDefault()}
+            >
+              <DropdownMenuItem onSelect={handleCopySpan}>
+                <CopyIcon />
+                Copy span
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>,
+          document.body
+        )}
     </div>
   )
 })
