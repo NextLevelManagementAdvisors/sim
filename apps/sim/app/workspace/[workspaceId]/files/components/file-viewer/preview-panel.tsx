@@ -481,7 +481,7 @@ const STATIC_MARKDOWN_COMPONENTS = {
         definition={definition ?? ''}
         isStreaming={isStreaming}
         zoomable
-        zoomClassName='h-[420px] rounded-lg'
+        zoomClassName='my-4 h-[420px] rounded-lg'
       />
     )
   },
@@ -620,7 +620,7 @@ const STATIC_MARKDOWN_COMPONENTS = {
   img: ({ src, alt }: React.ImgHTMLAttributes<HTMLImageElement>) => {
     const resolvedSrc = resolveSimFileUrl(typeof src === 'string' ? src : undefined)
     return (
-      <ZoomablePreview className='my-3 h-[360px] rounded-md' initialScale='fit'>
+      <ZoomablePreview className='my-3 h-[360px] rounded-md' initialScale='actual'>
         <img
           src={resolvedSrc}
           alt={alt ?? ''}
