@@ -481,7 +481,10 @@ async function handleIntegrationToolCall(
     const execContext = await prepareExecutionContext(
       userId,
       (args.workflowId as string) || '',
-      (args.chatId as string) || undefined
+      (args.chatId as string) || undefined,
+      // Pass workspaceId through so tools like create_job (no workflowId, no chatId, but
+      // needs workspace context) can be invoked successfully via the MCP endpoint.
+      args.workspaceId ? { workspaceId: args.workspaceId as string } : undefined
     )
 
     ensureHandlersRegistered()
@@ -519,7 +522,10 @@ async function handleDirectToolCall(
     const execContext = await prepareExecutionContext(
       userId,
       (args.workflowId as string) || '',
-      (args.chatId as string) || undefined
+      (args.chatId as string) || undefined,
+      // Pass workspaceId through so tools like create_job (no workflowId, no chatId, but
+      // needs workspace context) can be invoked successfully via the MCP endpoint.
+      args.workspaceId ? { workspaceId: args.workspaceId as string } : undefined
     )
 
     const toolCall = {

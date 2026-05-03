@@ -237,10 +237,15 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
     name: 'create_job',
     toolId: 'create_job',
     description:
-      'Create a scheduled background job that runs a prompt against the Mothership at a specified frequency or time. Use for polling, reminders, or deferred tasks. Provide cron for recurring jobs or time for one-time execution.',
+      'Create a scheduled background job that runs a prompt against the Mothership at a specified frequency or time. Use for polling, reminders, or deferred tasks. Provide cron for recurring jobs or time for one-time execution. Always pass workspaceId so the job is registered in the right workspace.',
     inputSchema: {
       type: 'object',
       properties: {
+        workspaceId: {
+          type: 'string',
+          description:
+            'Workspace ID the job belongs to. Required — the handler will reject without it.',
+        },
         title: {
           type: 'string',
           description: 'A short descriptive title for the job (e.g., "Email Poller").',
@@ -278,7 +283,7 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
           description: 'Maximum number of executions before the job auto-completes. Safety limit.',
         },
       },
-      required: ['title', 'prompt'],
+      required: ['workspaceId', 'title', 'prompt'],
     },
     annotations: { destructiveHint: false },
   },
