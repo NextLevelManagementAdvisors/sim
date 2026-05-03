@@ -463,7 +463,51 @@ async function handleToolsCall(
     return handleSubagentToolCall(subagentTool, args, userId, abortSignal)
   }
 
-  throw new McpError(ErrorCode.MethodNotFound, `Tool not found: ${params.name}`)
+  // Fall through: any tool not in DIRECT/SUBAGENT defs is dispatched via the standard
+  // tool executor, which routes through executeAppTool() for integration tools (gmail,
+  // google_calendar, slack, twilio, etc.). This is what makes the self-hosted Mothership
+  // brain see the user's connected integrations the same way the hosted Mothership does —
+  // sim sends the integrationTools catalog with each chat request, but external MCP
+  // clients can also exercise these tools directly by name.
+  return handleIntegrationToolCall(params.name, args, userId)
+}
+
+async function handleIntegrationToolCall(
+  toolId: string,
+  args: Record<string, unknown>,
+  userId: string
+): Promise<CallToolResult> {
+  try {
+    const execContext = await prepareExecutionContext(
+      userId,
+      (args.workflowId as string) || '',
+      (args.chatId as string) || undefined
+    )
+
+    ensureHandlersRegistered()
+    const result = await executeTool(toolId, args as Record<string, any>, execContext)
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result.output ?? result, null, 2),
+        },
+      ],
+      isError: !result.success,
+    }
+  } catch (error) {
+    logger.error('Integration tool execution failed', { toolId, error })
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Tool execution failed: ${toError(error).message}`,
+        },
+      ],
+      isError: true,
+    }
+  }
 }
 
 async function handleDirectToolCall(
