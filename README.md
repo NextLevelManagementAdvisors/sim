@@ -1,3 +1,12 @@
+<!--
+  NLMA fork of simstudioai/sim — Apache 2.0.
+  Self-hosted polish patches: BYOK works on self-hosted (apps/sim/lib/api-key/byok.ts),
+  expanded MCP tool surface (apps/sim/lib/copilot/tools/mcp/definitions.ts),
+  workspace API key auth on /api/mcp/copilot, local Copilot Keys page,
+  BYOK + Copilot Keys nav items visible on self-hosted.
+  See scripts/sync-upstream.sh to pull simstudioai/sim updates forward.
+-->
+
 <p align="center">
   <a href="https://sim.ai" target="_blank" rel="noopener noreferrer">
     <picture>
