@@ -27,6 +27,12 @@ export interface ListFoldersParams {
   workspaceId?: string
 }
 
+export interface ListWorkflowsParams {
+  workspaceId?: string
+  folderId?: string | null
+  scope?: 'active' | 'archived' | 'all'
+}
+
 // === Workflow Mutation Params ===
 
 export interface CreateWorkflowParams {

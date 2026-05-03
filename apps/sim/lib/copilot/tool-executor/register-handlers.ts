@@ -24,6 +24,7 @@ import {
   Grep as GrepTool,
   ListFolders,
   ListUserWorkspaces,
+  ListWorkflows,
   ListWorkspaceMcpServers,
   ManageCredential,
   ManageCustomTool,
@@ -107,6 +108,7 @@ import {
   executeGetWorkflowData,
   executeListFolders,
   executeListUserWorkspaces,
+  executeListWorkflows,
 } from '../tools/handlers/workflow/queries'
 import { registerHandlers } from './executor'
 import type { ToolHandler } from './types'
@@ -133,6 +135,7 @@ function buildHandlerMap(): Record<string, ToolHandler> {
   return {
     [ListUserWorkspaces.id]: h((_p, c) => executeListUserWorkspaces(c)),
     [ListFolders.id]: h(executeListFolders),
+    [ListWorkflows.id]: h(executeListWorkflows),
     [GetWorkflowData.id]: h(executeGetWorkflowData),
     [GetBlockOutputs.id]: h(executeGetBlockOutputs),
     [GetBlockUpstreamReferences.id]: h(executeGetBlockUpstreamReferences),

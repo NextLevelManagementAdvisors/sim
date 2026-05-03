@@ -52,6 +52,32 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
     annotations: { readOnlyHint: true },
   },
   {
+    name: 'list_workflows',
+    toolId: 'list_workflows',
+    description:
+      'List all workflows in a workspace. Returns workflow IDs, names, descriptions, folder placement, deployment state, and timestamps. Use this to discover what workflows exist before inspecting or modifying them.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspaceId: {
+          type: 'string',
+          description: 'Workspace ID to list workflows from.',
+        },
+        folderId: {
+          type: 'string',
+          description: 'Optional folder ID to scope the listing. Omit to list all workflows in the workspace.',
+        },
+        scope: {
+          type: 'string',
+          enum: ['active', 'archived', 'all'],
+          description: 'Which workflows to include. Defaults to "active".',
+        },
+      },
+      required: ['workspaceId'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: 'create_workflow',
     toolId: 'create_workflow',
     description:

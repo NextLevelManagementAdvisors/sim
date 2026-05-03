@@ -51,6 +51,7 @@ export interface ToolCatalogEntry {
     | 'knowledge_base'
     | 'list_folders'
     | 'list_user_workspaces'
+    | 'list_workflows'
     | 'list_workspace_mcp_servers'
     | 'manage_credential'
     | 'manage_custom_tool'
@@ -141,6 +142,7 @@ export interface ToolCatalogEntry {
     | 'knowledge_base'
     | 'list_folders'
     | 'list_user_workspaces'
+    | 'list_workflows'
     | 'list_workspace_mcp_servers'
     | 'manage_credential'
     | 'manage_custom_tool'
@@ -1648,6 +1650,27 @@ export const ListUserWorkspaces: ToolCatalogEntry = {
   route: 'sim',
   mode: 'async',
   parameters: { type: 'object', properties: {} },
+}
+
+export const ListWorkflows: ToolCatalogEntry = {
+  id: 'list_workflows',
+  name: 'list_workflows',
+  route: 'sim',
+  mode: 'async',
+  parameters: {
+    type: 'object',
+    properties: {
+      workspaceId: { type: 'string', description: 'Workspace ID (defaults to current workspace).' },
+      folderId: {
+        type: 'string',
+        description: 'Optional folder ID to filter by. Pass null/empty to list root-level workflows only.',
+      },
+      scope: {
+        type: 'string',
+        description: 'Which workflows to include: active (default), archived, or all.',
+      },
+    },
+  },
 }
 
 export const ListWorkspaceMcpServers: ToolCatalogEntry = {
@@ -3377,6 +3400,7 @@ export const TOOL_CATALOG: Record<string, ToolCatalogEntry> = {
   [KnowledgeBase.id]: KnowledgeBase,
   [ListFolders.id]: ListFolders,
   [ListUserWorkspaces.id]: ListUserWorkspaces,
+  [ListWorkflows.id]: ListWorkflows,
   [ListWorkspaceMcpServers.id]: ListWorkspaceMcpServers,
   [ManageCredential.id]: ManageCredential,
   [ManageCustomTool.id]: ManageCustomTool,

@@ -12,7 +12,7 @@ import {
   loadWorkflowFromNormalizedTables,
 } from '@/lib/workflows/persistence/utils'
 import { hasTriggerCapability } from '@/lib/workflows/triggers/trigger-utils'
-import { getWorkflowById, listFolders } from '@/lib/workflows/utils'
+import { getWorkflowById, listFolders, listWorkflows } from '@/lib/workflows/utils'
 import { listUserWorkspaces } from '@/lib/workspaces/utils'
 import { getBlock } from '@/blocks/registry'
 import { normalizeName } from '@/executor/constants'
@@ -24,6 +24,7 @@ import type {
   GetDeployedWorkflowStateParams,
   GetWorkflowDataParams,
   ListFoldersParams,
+  ListWorkflowsParams,
 } from '../param-types'
 
 export async function executeListUserWorkspaces(
@@ -57,6 +58,48 @@ export async function executeListFolders(
       output: {
         workspaceId,
         folders,
+      },
+    }
+  } catch (error) {
+    return { success: false, error: toError(error).message }
+  }
+}
+
+export async function executeListWorkflows(
+  params: ListWorkflowsParams,
+  context: ExecutionContext
+): Promise<ToolCallResult> {
+  try {
+    const workspaceId =
+      params?.workspaceId || context.workspaceId || (await getDefaultWorkspaceId(context.userId))
+
+    await ensureWorkspaceAccess(workspaceId, context.userId, 'read')
+
+    const all = await listWorkflows(workspaceId, { scope: params?.scope ?? 'active' })
+
+    const filtered =
+      params?.folderId === undefined
+        ? all
+        : all.filter((w) => (w.folderId ?? null) === (params.folderId ?? null))
+
+    const workflows = filtered.map((w) => ({
+      id: w.id,
+      name: w.name,
+      description: w.description ?? null,
+      folderId: w.folderId ?? null,
+      color: w.color ?? null,
+      isDeployed: w.isDeployed ?? false,
+      lastSynced: w.lastSynced ?? null,
+      createdAt: w.createdAt ?? null,
+      updatedAt: w.updatedAt ?? null,
+      archivedAt: w.archivedAt ?? null,
+    }))
+
+    return {
+      success: true,
+      output: {
+        workspaceId,
+        workflows,
       },
     }
   } catch (error) {
