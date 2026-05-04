@@ -309,6 +309,182 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
     annotations: { readOnlyHint: true },
   },
   {
+    name: 'edit_workflow',
+    toolId: 'edit_workflow',
+    description:
+      'Add, edit, or delete blocks in a workflow. THIS IS THE BLOCK-BUILDING TOOL — use it to populate a workflow shell created by create_workflow. Operations array supports add/edit/delete. For add: params={"type": "agent" | "googlecalendar" | "gmail" | "slack" | "function" | "router" | "starter" | etc., "name": "...", "inputs": {...}}. For edit: params={"inputs": {"temperature": 0.5}}. For delete: params={}. Use get_blocks_metadata first to discover block types and their input schemas.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workflowId: {
+          type: 'string',
+          description: 'Workflow ID to edit. Required.',
+        },
+        operations: {
+          type: 'array',
+          description: 'Array of edit operations.',
+          items: {
+            type: 'object',
+            properties: {
+              block_id: {
+                type: 'string',
+                description:
+                  'Block ID for the operation. For add operations this is the desired ID for the new block (any unique string).',
+              },
+              operation_type: {
+                type: 'string',
+                description: 'Type of operation to perform.',
+                enum: ['add', 'edit', 'delete', 'insert_into_subflow', 'extract_from_subflow'],
+              },
+              params: {
+                type: 'object',
+                description:
+                  'Parameters. For add: {"type": "<block_type>", "name": "<display_name>", "inputs": {...}}. For edit: {"inputs": {...}}. For delete: {}.',
+              },
+            },
+            required: ['operation_type', 'block_id', 'params'],
+          },
+        },
+      },
+      required: ['workflowId', 'operations'],
+    },
+    annotations: { destructiveHint: true },
+  },
+  {
+    name: 'get_blocks_metadata',
+    toolId: 'get_blocks_metadata',
+    description:
+      'Get metadata for all available block types (agent, googlecalendar, gmail, slack, function, router, etc.) and their input schemas. Call this BEFORE edit_workflow add operations so you know what types exist and what fields each block accepts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        blockTypes: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional list of specific block types to fetch metadata for. Omit to get all blocks.',
+        },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'get_credentials',
+    toolId: 'get_credentials',
+    description:
+      "List the user's connected third-party credentials (OAuth providers, API keys) for the workspace. Use this to know which integrations are available before recommending or wiring blocks. Returns provider, service name, and credential ID.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspaceId: { type: 'string', description: 'Workspace ID. Defaults to current workspace.' },
+      },
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'knowledge_base',
+    toolId: 'knowledge_base',
+    description:
+      "Manage knowledge bases — create, list, get, update, delete; manage chunks and sources; search/query KB content. Use a single 'operation' field to select what to do (e.g. 'create', 'list', 'add_source', 'search', 'delete'). See sim docs for the full operation list.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: {
+          type: 'string',
+          description:
+            "Operation to perform: create | list | get | update | delete | add_source | remove_source | search | list_chunks | etc.",
+        },
+        workspaceId: { type: 'string', description: 'Workspace ID. Defaults to current workspace.' },
+        knowledgeBaseId: { type: 'string', description: 'KB ID (required for ops on a specific KB).' },
+        name: { type: 'string', description: 'KB name (for create/update).' },
+        description: { type: 'string', description: 'KB description.' },
+        sourceType: {
+          type: 'string',
+          description:
+            'For add_source: gmail | google_drive | google_docs | notion | slack | confluence | jira | linear | github | obsidian | url | text | file | etc.',
+        },
+        query: { type: 'string', description: 'Search query (for search operations).' },
+      },
+      required: ['operation'],
+    },
+  },
+  {
+    name: 'user_table',
+    toolId: 'user_table',
+    description:
+      "Manage user tables — create tables with columns, list/get tables, add/update/delete rows, and add/remove columns. Single 'operation' field selects the action.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: {
+          type: 'string',
+          description:
+            'create_table | list_tables | get_table | delete_table | add_column | remove_column | insert_row | update_row | delete_row | list_rows | query_rows | etc.',
+        },
+        workspaceId: { type: 'string', description: 'Workspace ID. Defaults to current workspace.' },
+        tableId: { type: 'string', description: 'Table ID (required for ops on a specific table).' },
+        name: { type: 'string', description: 'Table name (for create_table).' },
+        columns: {
+          type: 'array',
+          items: { type: 'object' },
+          description:
+            'For create_table or add_column: array of {name, type, description?} objects. type is one of string|number|boolean|date|json.',
+        },
+        rowId: { type: 'string', description: 'Row ID (for update_row/delete_row).' },
+        row: { type: 'object', description: 'Row data as a {column: value} object.' },
+      },
+      required: ['operation'],
+    },
+  },
+  {
+    name: 'search_documentation',
+    toolId: 'search_documentation',
+    description:
+      "Search Sim's product documentation (block guides, integration guides, agent prompting tips, deployment instructions). Use this when the user asks 'how do I do X in sim' or when you need a primer on a specific block before configuring it.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query.' },
+        topK: { type: 'number', description: 'Max number of results (default 5).' },
+      },
+      required: ['query'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'set_environment_variables',
+    toolId: 'set_environment_variables',
+    description:
+      "Create or update workspace-scoped environment variables (the {{VAR_NAME}} ones referenced inside blocks). Use this when a block needs an API key, secret, or config value that isn't an OAuth credential.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspaceId: { type: 'string', description: 'Workspace ID.' },
+        variables: {
+          type: 'object',
+          description: 'Map of VAR_NAME -> value. Pass as { "MY_KEY": "secret-value" }.',
+        },
+      },
+      required: ['variables'],
+    },
+    annotations: { destructiveHint: true },
+  },
+  {
+    name: 'get_workflow_logs',
+    toolId: 'get_workflow_logs',
+    description:
+      'Read execution logs for a workflow — recent runs, errors, and per-block output. Use this to debug a failing workflow or to confirm a recent run succeeded.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workflowId: { type: 'string', description: 'Workflow ID.' },
+        limit: { type: 'number', description: 'Max number of recent runs to return (default 10).' },
+      },
+      required: ['workflowId'],
+    },
+    annotations: { readOnlyHint: true },
+  },
+  {
     name: 'get_block_outputs',
     toolId: 'get_block_outputs',
     description:
