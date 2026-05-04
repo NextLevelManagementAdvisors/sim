@@ -385,55 +385,83 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
     name: 'knowledge_base',
     toolId: 'knowledge_base',
     description:
-      "Manage knowledge bases — create, list, get, update, delete; manage chunks and sources; search/query KB content. Use a single 'operation' field to select what to do (e.g. 'create', 'list', 'add_source', 'search', 'delete'). See sim docs for the full operation list.",
+      "Manage knowledge bases. Operation enum: create | get | query | add_file | update | delete | delete_document | update_document | list_tags | create_tag | update_tag | delete_tag | get_tag_usage | add_connector | update_connector | delete_connector | sync_connector. All operation-specific fields go INSIDE the args object (NOT at the top level). Example: { operation: 'create', args: { name: 'My KB', description: '...' } } or { operation: 'query', args: { knowledgeBaseId: 'kb_123', query: 'how do refunds work' } }.",
     inputSchema: {
       type: 'object',
       properties: {
         operation: {
           type: 'string',
-          description:
-            "Operation to perform: create | list | get | update | delete | add_source | remove_source | search | list_chunks | etc.",
+          enum: [
+            'create',
+            'get',
+            'query',
+            'add_file',
+            'update',
+            'delete',
+            'delete_document',
+            'update_document',
+            'list_tags',
+            'create_tag',
+            'update_tag',
+            'delete_tag',
+            'get_tag_usage',
+            'add_connector',
+            'update_connector',
+            'delete_connector',
+            'sync_connector',
+          ],
+          description: 'Which operation to perform.',
         },
-        workspaceId: { type: 'string', description: 'Workspace ID. Defaults to current workspace.' },
-        knowledgeBaseId: { type: 'string', description: 'KB ID (required for ops on a specific KB).' },
-        name: { type: 'string', description: 'KB name (for create/update).' },
-        description: { type: 'string', description: 'KB description.' },
-        sourceType: {
-          type: 'string',
+        args: {
+          type: 'object',
           description:
-            'For add_source: gmail | google_drive | google_docs | notion | slack | confluence | jira | linear | github | obsidian | url | text | file | etc.',
+            "Operation-specific arguments. Common fields: knowledgeBaseId (required for ops on existing KB), workspaceId, name, description, query, fileId, documentId, connector type, etc. Field requirements vary per operation — see sim docs for full details.",
         },
-        query: { type: 'string', description: 'Search query (for search operations).' },
       },
-      required: ['operation'],
+      required: ['operation', 'args'],
     },
   },
   {
     name: 'user_table',
     toolId: 'user_table',
     description:
-      "Manage user tables — create tables with columns, list/get tables, add/update/delete rows, and add/remove columns. Single 'operation' field selects the action.",
+      "Manage user tables. Operation enum: create | create_from_file | import_file | get | get_schema | delete | insert_row | batch_insert_rows | get_row | query_rows | update_row | delete_row | update_rows_by_filter | delete_rows_by_filter | batch_update_rows | batch_delete_rows | add_column | rename_column | delete_column | update_column. All operation-specific fields go INSIDE the args object (NOT at top level). Example: { operation: 'create', args: { name: 'Expenses', schema: { columns: [{name:'date',type:'string'}, {name:'amount',type:'number'}] }, workspaceId: '...' } } or { operation: 'insert_row', args: { tableId: 'tbl_123', data: {date:'2026-05-04', amount: 12.50} } }.",
     inputSchema: {
       type: 'object',
       properties: {
         operation: {
           type: 'string',
-          description:
-            'create_table | list_tables | get_table | delete_table | add_column | remove_column | insert_row | update_row | delete_row | list_rows | query_rows | etc.',
+          enum: [
+            'create',
+            'create_from_file',
+            'import_file',
+            'get',
+            'get_schema',
+            'delete',
+            'insert_row',
+            'batch_insert_rows',
+            'get_row',
+            'query_rows',
+            'update_row',
+            'delete_row',
+            'update_rows_by_filter',
+            'delete_rows_by_filter',
+            'batch_update_rows',
+            'batch_delete_rows',
+            'add_column',
+            'rename_column',
+            'delete_column',
+            'update_column',
+          ],
+          description: 'Which operation to perform.',
         },
-        workspaceId: { type: 'string', description: 'Workspace ID. Defaults to current workspace.' },
-        tableId: { type: 'string', description: 'Table ID (required for ops on a specific table).' },
-        name: { type: 'string', description: 'Table name (for create_table).' },
-        columns: {
-          type: 'array',
-          items: { type: 'object' },
+        args: {
+          type: 'object',
           description:
-            'For create_table or add_column: array of {name, type, description?} objects. type is one of string|number|boolean|date|json.',
+            "Operation-specific arguments. Common fields: tableId (required for ops on existing table), workspaceId, name, description, schema (for create — { columns: [{name, type, unique?, position?}] }), data (row dict for insert/update), rows (array for batch), filter (mongo-style for query/update_by_filter), column (object for add_column), columnName/columnNames (for rename/delete_column).",
         },
-        rowId: { type: 'string', description: 'Row ID (for update_row/delete_row).' },
-        row: { type: 'object', description: 'Row data as a {column: value} object.' },
       },
-      required: ['operation'],
+      required: ['operation', 'args'],
     },
   },
   {
