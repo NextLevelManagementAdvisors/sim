@@ -38,6 +38,24 @@ export async function executeTool(
 ): Promise<ToolExecutionResult> {
   const canUseRegisteredHandler = isKnownTool(toolId) && isSimExecuted(toolId)
   if (!canUseRegisteredHandler) {
+    // Server tools (get_blocks_metadata, get_credentials, get_trigger_blocks) register
+    // their handler here but use a hardcoded name string instead of a TOOL_CATALOG
+    // entry, so isKnownTool returns false. Try the handler registry before falling
+    // through to executeAppTool — saves the "Tool not found" error and keeps these
+    // tools dispatchable from external MCP clients.
+    if (handlerRegistry.has(toolId)) {
+      const handler = handlerRegistry.get(toolId)!
+      try {
+        return await handler(params, context)
+      } catch (error) {
+        const message = toError(error).message
+        logger.error('Tool execution failed (catalog-less server tool)', {
+          toolId,
+          error: message,
+        })
+        return { success: false, error: message }
+      }
+    }
     const appParams = buildAppToolParams(params, context)
     return executeAppTool(toolId, appParams, false)
   }
