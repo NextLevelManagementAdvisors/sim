@@ -598,6 +598,22 @@ function SignupFormContent({ githubAvailable, googleAvailable, isProduction }: S
         </Link>
       </div>
 
+      {/*
+       * SMS notifications opt-in is a *separate, dedicated* flow at /sms-opt-in.
+       * It is intentionally NOT inline in this signup form so SMS consent is
+       * never bundled with account-creation consent — required for A2P 10DLC
+       * carrier review. Reviewers visiting /signup follow this link to find
+       * the consent form.
+       */}
+      <div className='pt-2 text-center font-light text-xs text-[var(--landing-text-muted)]'>
+        <Link
+          href='/sms-opt-in'
+          className='underline-offset-4 transition hover:text-[var(--landing-text)] hover:underline'
+        >
+          Want SMS notifications about your workflows? Opt in here.
+        </Link>
+      </div>
+
       <div className='absolute right-0 bottom-0 left-0 px-8 pb-8 text-center font-[340] text-[var(--landing-text-muted)] text-small leading-relaxed sm:px-8 md:px-11'>
         By creating an account, you agree to our{' '}
         <Link
