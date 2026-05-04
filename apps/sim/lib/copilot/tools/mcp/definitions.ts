@@ -354,17 +354,19 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
     name: 'get_blocks_metadata',
     toolId: 'get_blocks_metadata',
     description:
-      'Get metadata for all available block types (agent, googlecalendar, gmail, slack, function, router, etc.) and their input schemas. Call this BEFORE edit_workflow add operations so you know what types exist and what fields each block accepts.',
+      "Get metadata + input schemas for specific block types. Call this BEFORE edit_workflow add ops so you know what fields each block accepts. blockIds is REQUIRED and must be a non-empty array — the handler does not support 'list all'. Common block IDs to query: starter, agent, function, router, condition, loop, parallel, googlecalendar, gmail, googledrive, googledocs, googlesheets, slack, twilio_sms, twilio, notion, airtable, hubspot, salesforce, linear, asana, jira, github, discord, openai, anthropic, perplexity, exa, firecrawl, zendesk, intercom, hospitable, guesty.",
     inputSchema: {
       type: 'object',
       properties: {
-        blockTypes: {
+        blockIds: {
           type: 'array',
           items: { type: 'string' },
+          minItems: 1,
           description:
-            'Optional list of specific block types to fetch metadata for. Omit to get all blocks.',
+            "REQUIRED non-empty array of block type IDs to fetch metadata for. Pass the specific blocks you're considering using.",
         },
       },
+      required: ['blockIds'],
     },
     annotations: { readOnlyHint: true },
   },
@@ -464,21 +466,11 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
       required: ['operation', 'args'],
     },
   },
-  {
-    name: 'search_documentation',
-    toolId: 'search_documentation',
-    description:
-      "Search Sim's product documentation (block guides, integration guides, agent prompting tips, deployment instructions). Use this when the user asks 'how do I do X in sim' or when you need a primer on a specific block before configuring it.",
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query.' },
-        topK: { type: 'number', description: 'Max number of results (default 5).' },
-      },
-      required: ['query'],
-    },
-    annotations: { readOnlyHint: true },
-  },
+  // search_documentation deliberately omitted from DIRECT_TOOL_DEFS — it requires
+  // OPENAI_API_KEY for embedding queries which self-hosted instances often don't
+  // configure. The brain has enough block knowledge from its training set + can use
+  // get_blocks_metadata for canonical schemas. Re-add once a non-OpenAI embedding
+  // path or a config check is in place.
   {
     name: 'set_environment_variables',
     toolId: 'set_environment_variables',
@@ -906,17 +898,17 @@ export const DIRECT_TOOL_DEFS: DirectToolDef[] = [
     name: 'manage_credential',
     toolId: 'manage_credential',
     description:
-      'Manage OAuth/API credentials for third-party integrations (Slack, Google, GitHub, etc.). Pass operation: "list", "get", "add", "edit", or "delete".',
+      "Rename or delete an existing third-party credential. To LIST credentials use the get_credentials tool instead — manage_credential only supports 'rename' and 'delete'. To CREATE a new OAuth credential, direct the user to sim.nlma.io/workspace settings (OAuth requires interactive consent).",
     inputSchema: {
       type: 'object',
       properties: {
-        operation: { type: 'string', description: '"list", "get", "add", "edit", or "delete".' },
-        credentialId: { type: 'string', description: 'Credential ID (required for get/edit/delete).' },
-        provider: { type: 'string', description: 'Provider name, e.g. "slack" (for add).' },
+        operation: { type: 'string', enum: ['rename', 'delete'], description: 'Only "rename" or "delete" supported.' },
+        credentialId: { type: 'string', description: 'Credential ID (required).' },
+        displayName: { type: 'string', description: 'New display name (required for rename).' },
       },
-      required: ['operation'],
+      required: ['operation', 'credentialId'],
     },
-    annotations: { destructiveHint: false },
+    annotations: { destructiveHint: true },
   },
 
   // === OAuth ===
