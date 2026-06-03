@@ -1,8 +1,7 @@
 'use client'
 
-import { lazy, memo, Suspense, useEffect, useMemo } from 'react'
+import { lazy, memo, Suspense, useEffect, useMemo, useRef } from 'react'
 import { createLogger } from '@sim/logger'
-import { Square } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 import { Button, PlayOutline, Skeleton, Tooltip } from '@/components/emcn'
 import {
@@ -10,9 +9,11 @@ import {
   FileX,
   Folder as FolderIcon,
   Library,
+  Square,
   SquareArrowUpRight,
   WorkflowX,
 } from '@/components/emcn/icons'
+import { isApiClientError } from '@/lib/api/client/errors'
 import type { FilePreviewSession } from '@/lib/copilot/request/session'
 import {
   cancelRunToolExecution,
@@ -31,6 +32,7 @@ import {
   RESOURCE_TAB_ICON_BUTTON_CLASS,
   RESOURCE_TAB_ICON_CLASS,
 } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/resource-tabs/resource-tab-controls'
+import { hasRenderableFilePreviewContent } from '@/app/workspace/[workspaceId]/home/hooks/use-file-preview-sessions'
 import type {
   GenericResourceData,
   MothershipResource,
@@ -41,7 +43,7 @@ import {
   useUserPermissionsContext,
   useWorkspacePermissionsContext,
 } from '@/app/workspace/[workspaceId]/providers/workspace-permissions-provider'
-import { Table } from '@/app/workspace/[workspaceId]/tables/[tableId]/components'
+import { Table } from '@/app/workspace/[workspaceId]/tables/[tableId]/table'
 import { useUsageLimits } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/hooks'
 import { useWorkflowExecution } from '@/app/workspace/[workspaceId]/w/[workflowId]/hooks/use-workflow-execution'
 import { useFolders } from '@/hooks/queries/folders'
@@ -70,6 +72,7 @@ interface ResourceContentProps {
   previewSession?: FilePreviewSession | null
   genericResourceData?: GenericResourceData
   previewContextKey?: string
+  onNotFound?: (resourceId: string) => void
 }
 
 /**
@@ -86,6 +89,7 @@ export const ResourceContent = memo(function ResourceContent({
   previewSession,
   genericResourceData,
   previewContextKey,
+  onNotFound,
 }: ResourceContentProps) {
   const streamFileName = previewSession?.fileName || 'file.md'
   const syntheticFile = useMemo(() => {
@@ -113,13 +117,19 @@ export const ResourceContent = memo(function ResourceContent({
   const disableStreamingAutoScroll = previewSession?.operation === 'patch'
   const rawPreviewText = previewSession?.previewText
   const streamingPreviewText =
-    typeof rawPreviewText === 'string' && rawPreviewText.length > 0 ? rawPreviewText : undefined
+    previewSession &&
+    typeof rawPreviewText === 'string' &&
+    hasRenderableFilePreviewContent(previewSession)
+      ? rawPreviewText
+      : undefined
   const pendingOrStreamingFilePreviewText =
-    previewSession?.fileId === resource.id && typeof rawPreviewText === 'string'
+    previewSession?.fileId === resource.id &&
+    typeof rawPreviewText === 'string' &&
+    hasRenderableFilePreviewContent(previewSession)
       ? rawPreviewText
       : undefined
 
-  if (previewSession && resource.id === 'streaming-file') {
+  if (resource.id === 'streaming-file') {
     return (
       <div className='flex h-full flex-col overflow-hidden'>
         {streamingPreviewText !== undefined ? (
@@ -135,7 +145,7 @@ export const ResourceContent = memo(function ResourceContent({
           />
         ) : (
           <div className='flex h-full items-center justify-center'>
-            <p className='text-[13px] text-[var(--text-muted)]'>Processing file...</p>
+            <p className='text-[13px] text-[var(--text-muted)]'>Processing file…</p>
           </div>
         )}
       </div>
@@ -179,7 +189,14 @@ export const ResourceContent = memo(function ResourceContent({
       return <EmbeddedFolder key={resource.id} workspaceId={workspaceId} folderId={resource.id} />
 
     case 'log':
-      return <EmbeddedLog key={resource.id} logId={resource.id} />
+      return (
+        <EmbeddedLog
+          key={resource.id}
+          workspaceId={workspaceId}
+          logId={resource.id}
+          onNotFound={onNotFound ? () => onNotFound(resource.id) : undefined}
+        />
+      )
 
     case 'generic':
       return (
@@ -483,7 +500,7 @@ function EmbeddedWorkflow({ workspaceId, workflowId }: EmbeddedWorkflowProps) {
   if (!workflowExists || hasLoadError) {
     return (
       <div className='flex h-full flex-col items-center justify-center gap-3'>
-        <WorkflowX className='h-[32px] w-[32px] text-[var(--text-icon)]' />
+        <WorkflowX className='size-[32px] text-[var(--text-icon)]' />
         <div className='flex flex-col items-center gap-1'>
           <h2 className='font-medium text-[20px] text-[var(--text-primary)]'>Workflow not found</h2>
           <p className='text-[var(--text-body)] text-small'>
@@ -529,7 +546,7 @@ function EmbeddedFile({
   if (!file) {
     return (
       <div className='flex h-full flex-col items-center justify-center gap-3'>
-        <FileX className='h-[32px] w-[32px] text-[var(--text-icon)]' />
+        <FileX className='size-[32px] text-[var(--text-icon)]' />
         <div className='flex flex-col items-center gap-1'>
           <h2 className='font-medium text-[20px] text-[var(--text-primary)]'>File not found</h2>
           <p className='text-[var(--text-body)] text-small'>
@@ -574,7 +591,7 @@ function EmbeddedFolder({ workspaceId, folderId }: EmbeddedFolderProps) {
   if (!folder) {
     return (
       <div className='flex h-full flex-col items-center justify-center gap-3'>
-        <FolderIcon className='h-[32px] w-[32px] text-[var(--text-icon)]' />
+        <FolderIcon className='size-[32px] text-[var(--text-icon)]' />
         <div className='flex flex-col items-center gap-1'>
           <h2 className='font-medium text-[20px] text-[var(--text-primary)]'>Folder not found</h2>
           <p className='text-[var(--text-body)] text-small'>
@@ -600,7 +617,7 @@ function EmbeddedFolder({ workspaceId, folderId }: EmbeddedFolderProps) {
               className='flex items-center gap-2 rounded-[6px] px-3 py-2 text-left transition-colors hover:bg-[var(--surface-4)]'
             >
               <div
-                className='h-[12px] w-[12px] flex-shrink-0 rounded-[3px] border-[2px]'
+                className='size-[12px] flex-shrink-0 rounded-[3px] border-[2px]'
                 style={{
                   backgroundColor: w.color,
                   borderColor: workflowBorderColor(w.color),
@@ -617,18 +634,29 @@ function EmbeddedFolder({ workspaceId, folderId }: EmbeddedFolderProps) {
 }
 
 interface EmbeddedLogProps {
+  workspaceId: string
   logId: string
+  onNotFound?: () => void
 }
 
-function EmbeddedLog({ logId }: EmbeddedLogProps) {
-  const { data: log, isLoading } = useLogDetail(logId)
+function EmbeddedLog({ workspaceId, logId, onNotFound }: EmbeddedLogProps) {
+  const { data: log, isLoading, error } = useLogDetail(logId, workspaceId)
+
+  const onNotFoundRef = useRef(onNotFound)
+  onNotFoundRef.current = onNotFound
+
+  useEffect(() => {
+    if (isApiClientError(error) && error.status === 404) {
+      onNotFoundRef.current?.()
+    }
+  }, [error])
 
   if (isLoading) return LOADING_SKELETON
 
   if (!log) {
     return (
       <div className='flex h-full flex-col items-center justify-center gap-3'>
-        <Library className='h-[32px] w-[32px] text-[var(--text-icon)]' />
+        <Library className='size-[32px] text-[var(--text-icon)]' />
         <div className='flex flex-col items-center gap-1'>
           <h2 className='font-medium text-[20px] text-[var(--text-primary)]'>Log not found</h2>
           <p className='text-[var(--text-body)] text-small'>
@@ -653,7 +681,7 @@ interface EmbeddedLogActionsProps {
 
 export function EmbeddedLogActions({ workspaceId, logId }: EmbeddedLogActionsProps) {
   const router = useRouter()
-  const { data: log } = useLogDetail(logId)
+  const { data: log } = useLogDetail(logId, workspaceId)
 
   const handleOpenInLogs = () => {
     const param = log?.executionId ? `?executionId=${log.executionId}` : ''

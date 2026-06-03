@@ -14,26 +14,35 @@ import {
 import { getValidationErrorMessage } from '@/lib/api/server'
 import { checkSessionOrInternalAuth } from '@/lib/auth/hybrid'
 import { generateRequestId } from '@/lib/core/utils/request'
+import {
+  isPayloadSizeLimitError,
+  readFileToBufferWithLimit,
+  readFormDataWithLimit,
+} from '@/lib/core/utils/stream-limits'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
 import {
   addTableColumnsWithTx,
   batchInsertRowsWithTx,
   buildAutoMapping,
   CSV_MAX_BATCH_SIZE,
+  CSV_MAX_FILE_SIZE_BYTES,
   type CsvHeaderMapping,
   CsvImportValidationError,
   coerceRowsForTable,
+  dispatchAfterBatchInsert,
   inferColumnType,
   parseCsvBuffer,
   replaceTableRowsWithTx,
   sanitizeName,
   type TableDefinition,
+  type TableRow,
   type TableSchema,
   validateMapping,
 } from '@/lib/table'
 import { accessError, checkAccess } from '@/app/api/table/utils'
 
 const logger = createLogger('TableImportCSVExisting')
+const MAX_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 
 interface RouteParams {
   params: Promise<{ tableId: string }>
@@ -49,7 +58,10 @@ export const POST = withRouteHandler(async (request: NextRequest, { params }: Ro
       return NextResponse.json({ error: 'Authentication required' }, { status: 401 })
     }
 
-    const formData = await request.formData()
+    const formData = await readFormDataWithLimit(request, {
+      maxBytes: CSV_MAX_FILE_SIZE_BYTES + MAX_MULTIPART_OVERHEAD_BYTES,
+      label: 'CSV import body',
+    })
     const formValidation = csvImportFormSchema.safeParse({
       file: formData.get('file'),
       workspaceId: formData.get('workspaceId'),
@@ -59,9 +71,11 @@ export const POST = withRouteHandler(async (request: NextRequest, { params }: Ro
     const rawCreateColumns = formData.get('createColumns')
 
     if (!formValidation.success) {
+      const message = getValidationErrorMessage(formValidation.error)
+      const isSizeLimit = message.includes('File exceeds maximum allowed size')
       return NextResponse.json(
-        { error: getValidationErrorMessage(formValidation.error) },
-        { status: 400 }
+        { error: isSizeLimit ? 'CSV import file exceeds maximum size' : message },
+        { status: isSizeLimit ? 413 : 400 }
       )
     }
 
@@ -125,7 +139,10 @@ export const POST = withRouteHandler(async (request: NextRequest, { params }: Ro
       createColumns = createColumnsValidation.data
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer())
+    const buffer = await readFileToBufferWithLimit(file, {
+      maxBytes: CSV_MAX_FILE_SIZE_BYTES,
+      label: 'CSV import file',
+    })
     const delimiter = extensionValidation.data === 'tsv' ? '\t' : ','
     const { headers, rows } = await parseCsvBuffer(buffer, delimiter)
 
@@ -213,13 +230,13 @@ export const POST = withRouteHandler(async (request: NextRequest, { params }: Ro
       }
 
       try {
-        const inserted = await db.transaction(async (trx) => {
+        const txResult = await db.transaction(async (trx) => {
           let working = table
           if (additions.length > 0) {
             working = await addTableColumnsWithTx(trx, table, additions, requestId)
           }
 
-          let total = 0
+          const allInserted: TableRow[] = []
           for (let i = 0; i < coerced.length; i += CSV_MAX_BATCH_SIZE) {
             const batch = coerced.slice(i, i + CSV_MAX_BATCH_SIZE)
             const batchRequestId = generateId().slice(0, 8)
@@ -234,10 +251,15 @@ export const POST = withRouteHandler(async (request: NextRequest, { params }: Ro
               working,
               batchRequestId
             )
-            total += result.length
+            allInserted.push(...result)
           }
-          return total
+          return { inserted: allInserted, working }
         })
+        const { inserted: insertedRows, working: finalTable } = txResult
+        const inserted = insertedRows.length
+        // Fire trigger + scheduler AFTER the tx commits — both read through the
+        // global db connection and would otherwise see no rows.
+        dispatchAfterBatchInsert(finalTable, insertedRows, requestId)
 
         logger.info(`[${requestId}] Append CSV imported`, {
           tableId: table.id,
@@ -343,14 +365,19 @@ export const POST = withRouteHandler(async (request: NextRequest, { params }: Ro
     const message = toError(error).message
     logger.error(`[${requestId}] CSV import into existing table failed:`, error)
 
+    const isSizeLimitError =
+      isPayloadSizeLimitError(error) || message.includes('CSV import file exceeds maximum size')
     const isClientError =
       message.includes('CSV file has no') ||
       message.includes('already exists') ||
-      message.includes('Invalid column name')
+      message.includes('Invalid column name') ||
+      isSizeLimitError
 
     return NextResponse.json(
       { error: isClientError ? message : 'Failed to import CSV' },
-      { status: isClientError ? 400 : 500 }
+      {
+        status: isSizeLimitError ? 413 : isClientError ? 400 : 500,
+      }
     )
   }
 })

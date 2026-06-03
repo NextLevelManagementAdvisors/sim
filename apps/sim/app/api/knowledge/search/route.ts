@@ -1,4 +1,5 @@
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { authorizeWorkflowByWorkspacePermission } from '@sim/workflow-authz'
 import { type NextRequest, NextResponse } from 'next/server'
 import { knowledgeSearchBodySchema } from '@/lib/api/contracts/knowledge'
@@ -16,7 +17,7 @@ import type { StructuredFilter } from '@/lib/knowledge/types'
 import { estimateTokenCount } from '@/lib/tokenization/estimators'
 import {
   generateSearchEmbedding,
-  getDocumentNamesByIds,
+  getDocumentMetadataByIds,
   getQueryStrategy,
   handleTagAndVectorSearch,
   handleTagOnlySearch,
@@ -247,9 +248,21 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
 
     const hasFilters = structuredFilters && structuredFilters.length > 0
 
-    /** Oversample candidates when reranking so the reranker has more to choose from.
-     * Cap at 100 to bound Cohere request cost (1 search unit = ≤100 docs). */
-    const candidateTopK = useReranker ? Math.min(100, validatedData.topK * 4) : validatedData.topK
+    /** Oversample vector results when reranking so the reranker has more to choose from.
+     * Cap at 100 to bound Cohere request cost (1 search unit = ≤100 docs). When the caller
+     * supplies `rerankerInputCount`, honor it but never let it drop below `topK`
+     * (which would defeat the purpose) or exceed 100 (which would split into >1 search units). */
+    const rawInputCount = validatedData.rerankerInputCount
+    if (useReranker && rawInputCount !== undefined && rawInputCount < validatedData.topK) {
+      logger.warn(
+        `[${requestId}] rerankerInputCount (${rawInputCount}) is below topK (${validatedData.topK}); raising to topK`
+      )
+    }
+    const candidateTopK = useReranker
+      ? rawInputCount !== undefined
+        ? Math.min(100, Math.max(validatedData.topK, rawInputCount))
+        : Math.min(100, validatedData.topK * 4)
+      : validatedData.topK
 
     if (!hasQuery && hasFilters) {
       results = await handleTagOnlySearch({
@@ -300,7 +313,12 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
         const { results: ranked, isBYOK } = await rerank(
           validatedData.query!,
           results.map((r) => ({ id: r.id, text: r.content })),
-          { model: rerankerModel, topN: validatedData.topK, workspaceId }
+          {
+            model: rerankerModel,
+            topN: validatedData.topK,
+            workspaceId,
+            apiKey: validatedData.rerankerApiKey,
+          }
         )
         rerankBilled = true
         rerankIsBYOK = isBYOK
@@ -322,7 +340,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
         }
       } catch (error) {
         logger.warn(`[${requestId}] Reranker failed; falling back to vector ordering`, {
-          error: error instanceof Error ? error.message : 'Unknown error',
+          error: getErrorMessage(error, 'Unknown error'),
           model: rerankerModel,
           candidateCount,
           workspaceId,
@@ -344,7 +362,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
         cost = calculateCost(queryEmbeddingModel, tokenCount.count, 0, false)
       } catch (error) {
         logger.warn(`[${requestId}] Failed to calculate cost for search query`, {
-          error: error instanceof Error ? error.message : 'Unknown error',
+          error: getErrorMessage(error, 'Unknown error'),
         })
       }
     }
@@ -396,7 +414,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     })
 
     const documentIds = results.map((result) => result.documentId)
-    const documentNameMap = await getDocumentNamesByIds(documentIds)
+    const documentMetadataMap = await getDocumentMetadataByIds(documentIds)
 
     try {
       PlatformEvents.knowledgeBaseSearched({
@@ -432,9 +450,11 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
           })
 
           const rerankerScore = rerankedScores.get(result.id)
+          const docMeta = documentMetadataMap[result.documentId]
           return {
             documentId: result.documentId,
-            documentName: documentNameMap[result.documentId] || undefined,
+            documentName: docMeta?.filename || undefined,
+            sourceUrl: docMeta?.sourceUrl ?? null,
             content: result.content,
             chunkIndex: result.chunkIndex,
             metadata: tags,
@@ -472,7 +492,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     return NextResponse.json(
       {
         error: 'Failed to perform vector search',
-        message: error instanceof Error ? error.message : 'Unknown error',
+        message: getErrorMessage(error, 'Unknown error'),
       },
       { status: 500 }
     )

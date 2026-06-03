@@ -1,4 +1,5 @@
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
 import { ApiClientError } from '@/lib/api/client/errors'
 import { requestJson } from '@/lib/api/client/request'
@@ -9,14 +10,36 @@ import {
   type WorkflowStateContractInput,
   workflowVariablesContract,
 } from '@/lib/api/contracts/workflows'
+import { migrateSubblockIds } from '@/lib/workflows/migrations/subblock-migrations'
 import {
   type ExportWorkflowState,
   sanitizeForExport,
 } from '@/lib/workflows/sanitization/json-sanitizer'
+import { sanitizeMalformedSubBlocks } from '@/lib/workflows/sanitization/subblocks'
 import { regenerateWorkflowIds } from '@/stores/workflows/utils'
 import type { Variable, WorkflowState } from '@/stores/workflows/workflow/types'
 
 const logger = createLogger('WorkflowImportExport')
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function unwrapWorkflowExportEnvelope(data: unknown): unknown {
+  if (!isRecord(data)) {
+    return data
+  }
+
+  const envelopeData = data.data
+  if (
+    isRecord(envelopeData) &&
+    (envelopeData.state || envelopeData.version || envelopeData.workflow)
+  ) {
+    return envelopeData
+  }
+
+  return data
+}
 
 async function getJSZip() {
   const { default: JSZip } = await import('jszip')
@@ -43,7 +66,7 @@ export interface FolderExportData {
   sortOrder?: number
 }
 
-export interface WorkspaceExportStructure {
+interface WorkspaceExportStructure {
   workspace: {
     name: string
     color?: string
@@ -338,7 +361,7 @@ export interface WorkspaceImportMetadata {
 
 function extractSortOrder(content: string): number | undefined {
   try {
-    const parsed = JSON.parse(content)
+    const parsed = unwrapWorkflowExportEnvelope(JSON.parse(content)) as Record<string, any>
     return parsed.state?.metadata?.sortOrder ?? parsed.metadata?.sortOrder
   } catch {
     return undefined
@@ -418,10 +441,14 @@ export async function extractWorkflowsFromFiles(files: File[]): Promise<Imported
 
 export function extractWorkflowName(content: string, filename: string): string {
   try {
-    const parsed = JSON.parse(content)
+    const parsed = unwrapWorkflowExportEnvelope(JSON.parse(content)) as Record<string, any>
 
     if (parsed.state?.metadata?.name && typeof parsed.state.metadata.name === 'string') {
       return parsed.state.metadata.name.trim()
+    }
+
+    if (parsed.workflow?.name && typeof parsed.workflow.name === 'string') {
+      return parsed.workflow.name.trim()
     }
   } catch {
     // JSON parse failed, fall through to filename
@@ -441,63 +468,29 @@ export function extractWorkflowName(content: string, filename: string): string {
 }
 
 /**
- * Normalize subblock values by converting empty strings to null and filtering out invalid subblocks.
+ * Normalize subblock values by converting empty strings to null and repairing invalid subblocks.
  * This provides backwards compatibility for workflows exported before the null sanitization fix,
  * preventing Zod validation errors like "Expected array, received string".
  *
- * Also filters out malformed subBlocks that may have been created by bugs in previous exports:
- * - SubBlocks with key "undefined" (caused by assigning to undefined key)
- * - SubBlocks missing required fields like `id`
- * - SubBlocks with `type: "unknown"` (indicates malformed data)
+ * Also filters out subBlocks with the literal key "undefined", which cannot be associated
+ * with a stable block field.
  */
 function normalizeSubblockValues(blocks: Record<string, any>): Record<string, any> {
+  const { blocks: migratedBlocks } = migrateSubblockIds(blocks)
   const normalizedBlocks: Record<string, any> = {}
 
-  Object.entries(blocks).forEach(([blockId, block]) => {
+  Object.entries(migratedBlocks).forEach(([blockId, block]) => {
     const normalizedBlock = { ...block }
 
     if (block.subBlocks) {
-      const normalizedSubBlocks: Record<string, any> = {}
-
-      Object.entries(block.subBlocks).forEach(([subBlockId, subBlock]: [string, any]) => {
-        // Skip subBlocks with invalid keys (literal "undefined" string)
-        if (subBlockId === 'undefined') {
-          logger.warn(`Skipping malformed subBlock with key "undefined" in block ${blockId}`)
-          return
-        }
-
-        // Skip subBlocks that are null or not objects
-        if (!subBlock || typeof subBlock !== 'object') {
-          logger.warn(`Skipping invalid subBlock ${subBlockId} in block ${blockId}: not an object`)
-          return
-        }
-
-        // Skip subBlocks with type "unknown" (malformed data)
-        if (subBlock.type === 'unknown') {
-          logger.warn(
-            `Skipping malformed subBlock ${subBlockId} in block ${blockId}: type is "unknown"`
-          )
-          return
-        }
-
-        // Skip subBlocks missing required id field
-        if (!subBlock.id) {
-          logger.warn(
-            `Skipping malformed subBlock ${subBlockId} in block ${blockId}: missing id field`
-          )
-          return
-        }
-
-        const normalizedSubBlock = { ...subBlock }
-
-        // Convert empty strings to null for consistency
-        if (normalizedSubBlock.value === '') {
-          normalizedSubBlock.value = null
-        }
-
-        normalizedSubBlocks[subBlockId] = normalizedSubBlock
-      })
-
+      const { subBlocks: normalizedSubBlocks } = sanitizeMalformedSubBlocks(
+        {
+          id: typeof block.id === 'string' ? block.id : blockId,
+          type: typeof block.type === 'string' ? block.type : '',
+          subBlocks: block.subBlocks,
+        },
+        { convertEmptyStringToNull: true }
+      )
       normalizedBlock.subBlocks = normalizedSubBlocks
     }
 
@@ -526,9 +519,7 @@ export function parseWorkflowJson(
     try {
       data = JSON.parse(jsonContent)
     } catch (parseError) {
-      errors.push(
-        `Invalid JSON: ${parseError instanceof Error ? parseError.message : 'Parse error'}`
-      )
+      errors.push(`Invalid JSON: ${getErrorMessage(parseError, 'Parse error')}`)
       return { data: null, errors }
     }
 
@@ -538,10 +529,12 @@ export function parseWorkflowJson(
       return { data: null, errors }
     }
 
+    data = unwrapWorkflowExportEnvelope(data)
+
     // Handle new export format (version/exportedAt/state) or old format (blocks/edges at root)
     let workflowData: any
-    if (data.version && data.state) {
-      // New format with versioning
+    if (isRecord(data.state)) {
+      // Export/API envelope format with workflow state nested under `state`
       logger.info('Parsing workflow JSON with version', {
         version: data.version,
         exportedAt: data.exportedAt,
@@ -648,7 +641,7 @@ export function parseWorkflowJson(
     return { data: workflowState, errors: [] }
   } catch (error) {
     logger.error('Failed to parse workflow JSON:', error)
-    errors.push(`Unexpected error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    errors.push(`Unexpected error: ${getErrorMessage(error, 'Unknown error')}`)
     return { data: null, errors }
   }
 }

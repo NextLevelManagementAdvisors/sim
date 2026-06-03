@@ -4,9 +4,9 @@ import { and, desc, eq } from 'drizzle-orm'
 import { type NextRequest, NextResponse } from 'next/server'
 import { deleteCopilotApiKeyQuerySchema } from '@/lib/api/contracts'
 import { getSession } from '@/lib/auth'
-import { SIM_AGENT_API_URL } from '@/lib/copilot/constants'
 import { TraceAttr } from '@/lib/copilot/generated/trace-attributes-v1'
 import { fetchGo } from '@/lib/copilot/request/go/fetch'
+import { getMothershipBaseURL } from '@/lib/copilot/server/agent-url'
 import { env } from '@/lib/core/config/env'
 import { isHosted } from '@/lib/core/config/feature-flags'
 import { withRouteHandler } from '@/lib/core/utils/with-route-handler'
@@ -19,6 +19,7 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
     }
 
     const userId = session.user.id
+    const mothershipBaseURL = await getMothershipBaseURL({ userId })
 
     // Self-hosted: list user's personal keys directly from the api_key
     // table. These are the same keys the generate endpoint creates and
@@ -47,7 +48,7 @@ export const GET = withRouteHandler(async (request: NextRequest) => {
       return NextResponse.json({ keys }, { status: 200 })
     }
 
-    const res = await fetchGo(`${SIM_AGENT_API_URL}/api/validate-key/get-api-keys`, {
+    const res = await fetchGo(`${mothershipBaseURL}/api/validate-key/get-api-keys`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -98,6 +99,7 @@ export const DELETE = withRouteHandler(async (request: NextRequest) => {
     }
 
     const userId = session.user.id
+    const mothershipBaseURL = await getMothershipBaseURL({ userId })
     const queryResult = deleteCopilotApiKeyQuerySchema.safeParse(
       Object.fromEntries(new URL(request.url).searchParams)
     )
@@ -119,7 +121,7 @@ export const DELETE = withRouteHandler(async (request: NextRequest) => {
       return NextResponse.json({ success: true }, { status: 200 })
     }
 
-    const res = await fetchGo(`${SIM_AGENT_API_URL}/api/validate-key/delete`, {
+    const res = await fetchGo(`${mothershipBaseURL}/api/validate-key/delete`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

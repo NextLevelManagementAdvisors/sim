@@ -82,6 +82,13 @@ export const isEmailPasswordEnabled = !isFalsy(env.EMAIL_PASSWORD_SIGNUP_ENABLED
 export const isSignupEmailValidationEnabled = isTruthy(env.SIGNUP_EMAIL_VALIDATION_ENABLED)
 
 /**
+ * Is MX-based signup validation enabled (blocks no-MX domains and denylisted shared spam
+ * mail backends). Opt-in to avoid adding a DNS dependency or blocking legitimate signups on
+ * self-hosted deployments with non-standard mail setups; enable on abuse-targeted deployments.
+ */
+export const isSignupMxValidationEnabled = isTruthy(env.SIGNUP_MX_VALIDATION_ENABLED)
+
+/**
  * Is Trigger.dev enabled for async job processing
  */
 export const isTriggerDevEnabled = isTruthy(env.TRIGGER_DEV_ENABLED)
@@ -136,6 +143,21 @@ export const isAuditLogsEnabled = isTruthy(env.AUDIT_LOGS_ENABLED)
 export const isDataRetentionEnabled = isTruthy(env.DATA_RETENTION_ENABLED)
 
 /**
+ * Is data drains enabled via env var override
+ * This bypasses hosted requirements for self-hosted deployments
+ */
+export const isDataDrainsEnabled = isTruthy(env.DATA_DRAINS_ENABLED)
+
+/**
+ * Are workflow output columns enabled in user tables.
+ * Defaults to false; set NEXT_PUBLIC_WORKFLOW_COLUMNS_ENABLED=true to show
+ * the "Workflow" column type in the new-column dropdown.
+ */
+export const isWorkflowColumnsEnabledClient = isTruthy(
+  getEnv('NEXT_PUBLIC_WORKFLOW_COLUMNS_ENABLED')
+)
+
+/**
  * Is E2B enabled for remote code execution
  */
 export const isE2bEnabled = isTruthy(env.E2B_ENABLED)
@@ -155,6 +177,14 @@ export const isOllamaConfigured = Boolean(env.OLLAMA_URL)
  * Set NEXT_PUBLIC_AZURE_CONFIGURED=true in self-hosted deployments on Azure.
  */
 export const isAzureConfigured = isTruthy(getEnv('NEXT_PUBLIC_AZURE_CONFIGURED'))
+
+/**
+ * Whether a Cohere API key is pre-configured server-side for the Knowledge block reranker
+ * (`COHERE_API_KEY` or `COHERE_API_KEY_1/2/3`). When true, the Cohere API Key field is hidden
+ * in the Knowledge block UI.
+ * Set NEXT_PUBLIC_COHERE_CONFIGURED=true in self-hosted deployments that ship a Cohere key.
+ */
+export const isCohereConfigured = isTruthy(getEnv('NEXT_PUBLIC_COHERE_CONFIGURED'))
 
 /**
  * Are invitations disabled globally

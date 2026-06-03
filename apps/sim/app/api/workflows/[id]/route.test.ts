@@ -27,8 +27,13 @@ const mockGetWorkflowById = workflowsUtilsMockFns.mockGetWorkflowById
 const mockAuthorizeWorkflowByWorkspacePermission =
   workflowAuthzMockFns.mockAuthorizeWorkflowByWorkspacePermission
 const mockPerformDeleteWorkflow = workflowsOrchestrationMockFns.mockPerformDeleteWorkflow
-const mockDbUpdate = vi.fn()
-const mockDbSelect = vi.fn()
+const mockPerformUpdateWorkflow = workflowsOrchestrationMockFns.mockPerformUpdateWorkflow
+
+const { mockDbUpdate, mockDbSelect, mockDbTransaction } = vi.hoisted(() => ({
+  mockDbUpdate: vi.fn(),
+  mockDbSelect: vi.fn(),
+  mockDbTransaction: vi.fn(),
+}))
 
 /**
  * Helper to set mock auth state consistently across getSession and hybrid auth.
@@ -65,6 +70,7 @@ vi.mock('@sim/db', () => ({
   db: {
     update: () => mockDbUpdate(),
     select: () => mockDbSelect(),
+    transaction: mockDbTransaction,
   },
   workflow: {},
 }))
@@ -80,6 +86,34 @@ describe('Workflow By ID API Route', () => {
     })
 
     mockLoadWorkflowFromNormalizedTables.mockResolvedValue(null)
+    mockPerformUpdateWorkflow.mockImplementation(async (params) => ({
+      success: true,
+      workflow: {
+        id: params.workflowId,
+        name: params.name ?? params.currentName,
+        description: params.description ?? null,
+        color: params.color ?? null,
+        workspaceId: params.workspaceId,
+        folderId: params.folderId ?? params.currentFolderId ?? null,
+        sortOrder: params.sortOrder ?? null,
+        locked: params.locked ?? null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        archivedAt: null,
+      },
+    }))
+    mockDbTransaction.mockImplementation(async (callback) =>
+      callback({
+        execute: vi.fn().mockResolvedValue(undefined),
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([]),
+            }),
+          }),
+        }),
+      })
+    )
   })
 
   describe('GET /api/workflows/[id]', () => {
@@ -363,7 +397,42 @@ describe('Workflow By ID API Route', () => {
       expect(data.error).toBe('Cannot delete the only workflow in the workspace')
     })
 
-    it.concurrent('should deny deletion for non-admin users', async () => {
+    it('should allow user with write permission to delete workflow', async () => {
+      const mockWorkflow = {
+        id: 'workflow-123',
+        userId: 'other-user',
+        name: 'Test Workflow',
+        workspaceId: 'workspace-456',
+      }
+
+      mockGetSession({ user: { id: 'user-123' } })
+
+      mockGetWorkflowById.mockResolvedValue(mockWorkflow)
+      mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValue({
+        allowed: true,
+        status: 200,
+        workflow: mockWorkflow,
+        workspacePermission: 'write',
+      })
+
+      mockPerformDeleteWorkflow.mockResolvedValue({ success: true })
+
+      const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123', {
+        method: 'DELETE',
+      })
+      const params = Promise.resolve({ id: 'workflow-123' })
+
+      const response = await DELETE(req, { params })
+
+      expect(response.status).toBe(200)
+      const data = await response.json()
+      expect(data.success).toBe(true)
+      expect(mockAuthorizeWorkflowByWorkspacePermission).toHaveBeenCalledWith(
+        expect.objectContaining({ workflowId: 'workflow-123', action: 'write' })
+      )
+    })
+
+    it.concurrent('should deny deletion for read-only users', async () => {
       const mockWorkflow = {
         id: 'workflow-123',
         userId: 'other-user',
@@ -377,9 +446,9 @@ describe('Workflow By ID API Route', () => {
       mockAuthorizeWorkflowByWorkspacePermission.mockResolvedValue({
         allowed: false,
         status: 403,
-        message: 'Unauthorized: Access denied to admin this workflow',
+        message: 'Unauthorized: Access denied to write this workflow',
         workflow: mockWorkflow,
-        workspacePermission: null,
+        workspacePermission: 'read',
       })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123', {
@@ -391,7 +460,7 @@ describe('Workflow By ID API Route', () => {
 
       expect(response.status).toBe(403)
       const data = await response.json()
-      expect(data.error).toBe('Unauthorized: Access denied to admin this workflow')
+      expect(data.error).toBe('Unauthorized: Access denied to write this workflow')
     })
   })
 
@@ -578,8 +647,11 @@ describe('Workflow By ID API Route', () => {
         workflow: mockWorkflow,
         workspacePermission: 'write',
       })
-
-      mockDuplicateCheck([{ id: 'workflow-other' }])
+      mockPerformUpdateWorkflow.mockResolvedValueOnce({
+        success: false,
+        error: 'A workflow named "Duplicate Name" already exists in this folder',
+        errorCode: 'conflict',
+      })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123', {
         method: 'PUT',
@@ -611,8 +683,11 @@ describe('Workflow By ID API Route', () => {
         workflow: mockWorkflow,
         workspacePermission: 'write',
       })
-
-      mockDuplicateCheck([{ id: 'workflow-other' }])
+      mockPerformUpdateWorkflow.mockResolvedValueOnce({
+        success: false,
+        error: 'A workflow named "Duplicate Name" already exists in this folder',
+        errorCode: 'conflict',
+      })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123', {
         method: 'PUT',
@@ -731,9 +806,11 @@ describe('Workflow By ID API Route', () => {
         workflow: mockWorkflow,
         workspacePermission: 'write',
       })
-
-      // Duplicate exists in target folder
-      mockDuplicateCheck([{ id: 'workflow-other' }])
+      mockPerformUpdateWorkflow.mockResolvedValueOnce({
+        success: false,
+        error: 'A workflow named "My Workflow" already exists in this folder',
+        errorCode: 'conflict',
+      })
 
       const req = new NextRequest('http://localhost:3000/api/workflows/workflow-123', {
         method: 'PUT',

@@ -11,12 +11,15 @@ import {
   useRef,
   useState,
 } from 'react'
+import { createLogger } from '@sim/logger'
 import { Paperclip } from 'lucide-react'
 import { useParams } from 'next/navigation'
 import { Button, Tooltip } from '@/components/emcn'
 import { useSession } from '@/lib/auth/auth-client'
+import { getMothershipAttachmentPreviewUrl } from '@/lib/copilot/chat/attachment-preview'
 import { SIM_RESOURCE_DRAG_TYPE, SIM_RESOURCES_DRAG_TYPE } from '@/lib/copilot/resource-types'
 import { cn } from '@/lib/core/utils/cn'
+import { handleKeyboardActivation } from '@/lib/core/utils/keyboard'
 import { CHAT_ACCEPT_ATTRIBUTE } from '@/lib/uploads/utils/validation'
 import { ContextMentionIcon } from '@/app/workspace/[workspaceId]/home/components/context-mention-icon'
 import { useAvailableResources } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/add-resource-dropdown'
@@ -57,6 +60,8 @@ import { useMothershipDraftsStore } from '@/stores/mothership-drafts/store'
 import type { ChatContext } from '@/stores/panel'
 
 export type { FileAttachmentForApi } from '@/app/workspace/[workspaceId]/home/types'
+
+const logger = createLogger('UserInput')
 
 function getCaretAnchor(
   textarea: HTMLTextAreaElement,
@@ -148,7 +153,8 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
   const [value, setValue] = useState(() => {
     if (defaultValue) return defaultValue
     if (!draftScopeKey) return ''
-    return useMothershipDraftsStore.getState().drafts[draftScopeKey]?.text ?? ''
+    const text = useMothershipDraftsStore.getState().drafts[draftScopeKey]?.text
+    return typeof text === 'string' ? text : ''
   })
   const overlayRef = useRef<HTMLDivElement>(null)
   const plusMenuRef = useRef<PlusMenuHandle>(null)
@@ -189,14 +195,17 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
   useEffect(() => {
     if (hasRestoredDraftRef.current || !draftScopeKey) return
     hasRestoredDraftRef.current = true
-    const draft = useMothershipDraftsStore.getState().drafts[draftScopeKey]
-    if (!draft) return
-    if (draft.contexts?.length) {
-      contextManagement.setSelectedContexts(draft.contexts)
-    }
-    if (draft.fileAttachments?.length) {
-      files.restoreAttachedFiles(
-        draft.fileAttachments.map((a) => ({
+    let restoredContexts: ChatContext[] | null = null
+    let restoredFiles: AttachedFile[] | null = null
+    let caretText: string | null = null
+    try {
+      const draft = useMothershipDraftsStore.getState().drafts[draftScopeKey]
+      if (!draft) return
+      if (draft.contexts?.length) {
+        restoredContexts = draft.contexts
+      }
+      if (draft.fileAttachments?.length) {
+        restoredFiles = draft.fileAttachments.map((a) => ({
           id: a.id,
           name: a.filename,
           size: a.size,
@@ -204,14 +213,24 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
           path: a.path ?? '',
           key: a.key,
           uploading: false,
+          previewUrl: getMothershipAttachmentPreviewUrl(a),
         }))
-      )
+      }
+      if (typeof draft.text === 'string' && draft.text.length > 0) {
+        caretText = draft.text
+      }
+    } catch (err) {
+      logger.error('Failed to read draft, clearing', { err })
+      useMothershipDraftsStore.getState().clearDraft(draftScopeKey)
+      return
     }
-    if (draft.text) {
+    if (restoredContexts) contextManagement.setSelectedContexts(restoredContexts)
+    if (restoredFiles) files.restoreAttachedFiles(restoredFiles)
+    if (caretText !== null) {
       const textarea = textareaRef.current
       if (textarea) {
         textarea.focus()
-        textarea.setSelectionRange(draft.text.length, draft.text.length)
+        textarea.setSelectionRange(caretText.length, caretText.length)
       }
     }
   }, []) // eslint-disable-line react-hooks/exhaustive-deps -- intentional mount-only restore
@@ -369,6 +388,7 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
           path: a.path ?? '',
           key: a.key,
           uploading: false,
+          previewUrl: getMothershipAttachmentPreviewUrl(a),
         }))
         files.restoreAttachedFiles(restored)
         contextManagement.setSelectedContexts(msg.contexts ?? [])
@@ -543,6 +563,10 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
       }
     })
     return () => window.cancelAnimationFrame(raf)
+  }, [textareaRef])
+
+  const focusTextarea = useCallback(() => {
+    textareaRef.current?.focus()
   }, [textareaRef])
 
   const handleContainerClick = useCallback(
@@ -848,7 +872,7 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
         <ContextMentionIcon
           context={matchingCtx}
           workflowColor={wfId ? (workflowsById[wfId]?.color ?? null) : null}
-          className='absolute inset-0 m-auto h-[12px] w-[12px] text-[var(--text-icon)]'
+          className='absolute inset-0 m-auto size-[12px] text-[var(--text-icon)]'
         />
       ) : null
 
@@ -881,7 +905,13 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
 
   return (
     <div
+      role='group'
+      aria-label='Message input'
       onClick={handleContainerClick}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return
+        handleKeyboardActivation(event, focusTextarea)
+      }}
       className={cn(
         'relative z-10 mx-auto w-full max-w-[42rem] cursor-text rounded-[20px] border border-[var(--border-1)] bg-[var(--white)] px-2.5 py-2 dark:bg-[var(--surface-4)]',
         isInitialView && 'shadow-sm'
@@ -943,9 +973,9 @@ export const UserInput = forwardRef<UserInputHandle, UserInputProps>(function Us
                 variant='ghost'
                 onClick={handleFileSelectStable}
                 aria-label='Attach file'
-                className='h-[28px] w-[28px] rounded-full p-0 hover-hover:bg-[var(--surface-hover)]'
+                className='size-[28px] rounded-full p-0 hover-hover:bg-[var(--surface-hover)]'
               >
-                <Paperclip className='h-[14px] w-[14px] text-[var(--text-icon)]' strokeWidth={2} />
+                <Paperclip className='size-[14px] text-[var(--text-icon)]' strokeWidth={2} />
               </Button>
             </Tooltip.Trigger>
             <Tooltip.Content side='top'>Attach file</Tooltip.Content>

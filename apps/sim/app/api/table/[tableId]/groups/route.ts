@@ -110,6 +110,14 @@ export const PATCH = withRouteHandler(async (request: NextRequest, { params }: R
         ...(validated.newOutputColumns !== undefined
           ? { newOutputColumns: validated.newOutputColumns }
           : {}),
+        ...(validated.mappingUpdates !== undefined
+          ? { mappingUpdates: validated.mappingUpdates }
+          : {}),
+        ...(validated.inputMappings !== undefined
+          ? { inputMappings: validated.inputMappings }
+          : {}),
+        ...(validated.type !== undefined ? { type: validated.type } : {}),
+        ...(validated.autoRun !== undefined ? { autoRun: validated.autoRun } : {}),
       },
       requestId
     )

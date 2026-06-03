@@ -43,9 +43,17 @@ export type ConnectedAccount = z.output<typeof connectedAccountSchema>
 
 export const trelloTokenBodySchema = z.object({
   token: z.string().min(1),
+  state: z.string().min(1, 'state is required'),
 })
 
 const emptyTrelloAuthQuerySchema = z.object({}).passthrough()
+
+const trelloCallbackQuerySchema = z
+  .object({
+    state: z.string().min(1).optional(),
+    error: z.string().min(1).optional(),
+  })
+  .passthrough()
 
 export const oauthTokenRequestBodySchema = z
   .object({
@@ -77,6 +85,8 @@ const oauthTokenResponseSchema = z.object({
   accessToken: z.string(),
   idToken: z.string().optional(),
   instanceUrl: z.string().optional(),
+  cloudId: z.string().optional(),
+  domain: z.string().optional(),
 })
 
 export const oauthTokenGetContract = defineRouteContract({
@@ -133,7 +143,7 @@ export const oauthAuthorizeParamsResponseSchema = z.object({
   response_type: z.literal('code'),
 })
 
-const SHOPIFY_SHOP_DOMAIN_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/
+const SHOPIFY_SHOP_DOMAIN_REGEX = /^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.myshopify\.com$/
 export const shopifyShopDomainSchema = z.string().regex(SHOPIFY_SHOP_DOMAIN_REGEX)
 
 export const listOAuthConnectionsContract = defineRouteContract({
@@ -201,7 +211,7 @@ export const authorizeTrelloContract = defineRouteContract({
 export const trelloCallbackContract = defineRouteContract({
   method: 'GET',
   path: '/api/auth/trello/callback',
-  query: emptyTrelloAuthQuerySchema,
+  query: trelloCallbackQuerySchema,
   response: { mode: 'text' },
 })
 

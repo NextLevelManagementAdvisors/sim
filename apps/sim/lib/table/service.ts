@@ -8,15 +8,22 @@
  */
 
 import { db } from '@sim/db'
-import { userTableDefinitions, userTableRows, workflowExecutionLogs } from '@sim/db/schema'
+import {
+  tableRowExecutions,
+  userTableDefinitions,
+  userTableRows,
+  workflowExecutionLogs,
+} from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
 import { getPostgresErrorCode } from '@sim/utils/errors'
 import { generateId } from '@sim/utils/id'
-import { and, count, eq, gt, gte, inArray, isNull, sql } from 'drizzle-orm'
-import { env } from '@/lib/core/config/env'
+import { and, count, eq, gt, gte, inArray, isNull, type SQL, sql } from 'drizzle-orm'
+import { MATERIALIZE_CONCURRENCY, mapWithConcurrency } from '@/lib/core/utils/concurrency'
 import { generateRestoreName } from '@/lib/core/utils/restore-name'
-import { getSocketServerUrl } from '@/lib/core/utils/urls'
+import type { DbOrTx } from '@/lib/db/types'
+import { materializeExecutionData } from '@/lib/logs/execution/trace-store'
 import { COLUMN_TYPES, NAME_PATTERN, TABLE_LIMITS, USER_TABLE_ROWS_SQL_NAME } from './constants'
+import { areGroupDepsSatisfied } from './deps'
 import { buildFilterClause, buildSortClause } from './sql'
 import { fireTableTrigger } from './trigger'
 import type {
@@ -57,68 +64,21 @@ import type {
 import {
   checkBatchUniqueConstraintsDb,
   checkUniqueConstraintsDb,
+  coerceRowToSchema,
+  coerceRowValues,
   getUniqueColumns,
-  validateRowAgainstSchema,
   validateRowSize,
   validateTableName,
   validateTableSchema,
 } from './validation'
-import { assertValidSchema, scheduleWorkflowGroupRuns } from './workflow-columns'
+import {
+  assertValidSchema,
+  cancelWorkflowGroupRuns,
+  runWorkflowColumn,
+  stripGroupDeps,
+} from './workflow-columns'
 
 const logger = createLogger('TableService')
-
-/**
- * Fire-and-forget bridge to the realtime socket server. Mirrors the
- * `notifyWorkflowArchived` pattern in `lib/workflows/lifecycle.ts:35`.
- * Failures are logged but never thrown — sockets are best-effort, polling
- * is the fallback. Each helper sends a single row delta so the realtime
- * server can broadcast to subscribed clients in the table room.
- */
-function notifyTableRowUpdated(tableId: string, row: TableRow): void {
-  void fetch(`${getSocketServerUrl()}/api/table-row-updated`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.INTERNAL_API_SECRET,
-    },
-    body: JSON.stringify({
-      tableId,
-      rowId: row.id,
-      data: row.data,
-      executions: row.executions,
-      position: row.position,
-      updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : row.updatedAt,
-    }),
-  }).catch((err) => {
-    logger.warn(`table-row-updated bridge failed for ${tableId}/${row.id}:`, err)
-  })
-}
-
-function notifyTableRowDeleted(tableId: string, rowId: string): void {
-  void fetch(`${getSocketServerUrl()}/api/table-row-deleted`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.INTERNAL_API_SECRET,
-    },
-    body: JSON.stringify({ tableId, rowId }),
-  }).catch((err) => {
-    logger.warn(`table-row-deleted bridge failed for ${tableId}/${rowId}:`, err)
-  })
-}
-
-function notifyTableDeleted(tableId: string): void {
-  void fetch(`${getSocketServerUrl()}/api/table-deleted`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': env.INTERNAL_API_SECRET,
-    },
-    body: JSON.stringify({ tableId }),
-  }).catch((err) => {
-    logger.warn(`table-deleted bridge failed for ${tableId}:`, err)
-  })
-}
 
 export class TableConflictError extends Error {
   readonly code = 'TABLE_EXISTS' as const
@@ -169,6 +129,39 @@ async function acquireTablePositionLock(trx: DbTransaction, tableId: string) {
 }
 
 /**
+ * Serializes schema/metadata read-modify-writes for a single table so
+ * concurrent mutators can't clobber each other's `schema` JSONB
+ * (last-writer-wins). Takes a transaction-scoped advisory lock keyed on
+ * `tableId`, then re-reads the table INSIDE the lock and hands the fresh
+ * definition + transaction to `mutate`. Each serialized writer therefore
+ * validates and computes against the prior writer's committed columns.
+ *
+ * Uses an advisory lock (not `SELECT ... FOR UPDATE` on the definition row) so
+ * it adds no edges to the row-lock graph — the row-count trigger (migration
+ * 0198) locks the definition row from `insertRow`/`deleteRow`, and a FOR UPDATE
+ * here would invert that order. Mirrors `acquireTablePositionLock`. The lock and
+ * the read both release at COMMIT/ROLLBACK; the wait is bounded by the
+ * `statement_timeout` set in `setTableTxTimeouts`.
+ */
+async function withLockedTable<T>(
+  tableId: string,
+  mutate: (table: TableDefinition, trx: DbTransaction) => Promise<T>,
+  opts?: { includeArchived?: boolean }
+): Promise<T> {
+  return db.transaction(async (trx) => {
+    await setTableTxTimeouts(trx)
+    await trx.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtextextended(${`user_table_schema:${tableId}`}, 0))`
+    )
+    const table = await getTableById(tableId, { tx: trx, includeArchived: opts?.includeArchived })
+    if (!table) {
+      throw new Error('Table not found')
+    }
+    return mutate(table, trx)
+  })
+}
+
+/**
  * Returns the next auto-assigned `position` for a table (max(position) + 1, or 0
  * if empty). Callers must hold `acquireTablePositionLock` to avoid two concurrent
  * writers computing the same value against the same snapshot.
@@ -209,12 +202,43 @@ function scaledStatementTimeoutMs(
  * @param tableId - Table ID to fetch
  * @returns Table definition or null if not found
  */
+/**
+ * Returns `schema` with `columns` sorted by `metadata.columnOrder` (the user-
+ * editable visible order). Columns missing from `columnOrder` are appended at
+ * the end in their original (schema-creation) order — covers tables created
+ * before `columnOrder` existed and any drift from out-of-band column adds.
+ *
+ * This makes `schema.columns` the single source of truth for column order on
+ * the wire. The client doesn't have to join the two arrays itself — every
+ * consumer (grid, sidebar, copilot, mothership) gets the same ordered list.
+ */
+function applyColumnOrderToSchema(
+  schema: TableSchema,
+  metadata: TableMetadata | null
+): TableSchema {
+  const order = metadata?.columnOrder
+  if (!order || order.length === 0) return schema
+  const byName = new Map<string, TableSchema['columns'][number]>()
+  for (const c of schema.columns) byName.set(c.name, c)
+  const ordered: TableSchema['columns'] = []
+  for (const name of order) {
+    const c = byName.get(name)
+    if (c) {
+      ordered.push(c)
+      byName.delete(name)
+    }
+  }
+  for (const c of byName.values()) ordered.push(c)
+  return { ...schema, columns: ordered }
+}
+
 export async function getTableById(
   tableId: string,
-  options?: { includeArchived?: boolean }
+  options?: { includeArchived?: boolean; tx?: DbOrTx }
 ): Promise<TableDefinition | null> {
-  const { includeArchived = false } = options ?? {}
-  const results = await db
+  const { includeArchived = false, tx } = options ?? {}
+  const executor = tx ?? db
+  const results = await executor
     .select({
       id: userTableDefinitions.id,
       name: userTableDefinitions.name,
@@ -240,12 +264,13 @@ export async function getTableById(
   if (results.length === 0) return null
 
   const table = results[0]
+  const metadata = (table.metadata as TableMetadata) ?? null
   return {
     id: table.id,
     name: table.name,
     description: table.description,
-    schema: table.schema as TableSchema,
-    metadata: (table.metadata as TableMetadata) ?? null,
+    schema: applyColumnOrderToSchema(table.schema as TableSchema, metadata),
+    metadata,
     rowCount: table.rowCount,
     maxRows: table.maxRows,
     workspaceId: table.workspaceId,
@@ -262,7 +287,7 @@ export async function getTableById(
  * @param workspaceId - Workspace ID to list tables for
  * @returns Array of table definitions
  */
-export async function countTables(workspaceId: string): Promise<number> {
+async function countTables(workspaceId: string): Promise<number> {
   const [result] = await db
     .select({ count: count() })
     .from(userTableDefinitions)
@@ -311,20 +336,23 @@ export async function listTables(
     )
     .orderBy(userTableDefinitions.createdAt)
 
-  return tables.map((t) => ({
-    id: t.id,
-    name: t.name,
-    description: t.description,
-    schema: t.schema as TableSchema,
-    metadata: (t.metadata as TableMetadata) ?? null,
-    rowCount: t.rowCount,
-    maxRows: t.maxRows,
-    workspaceId: t.workspaceId,
-    createdBy: t.createdBy,
-    archivedAt: t.archivedAt,
-    createdAt: t.createdAt,
-    updatedAt: t.updatedAt,
-  }))
+  return tables.map((t) => {
+    const metadata = (t.metadata as TableMetadata) ?? null
+    return {
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      schema: applyColumnOrderToSchema(t.schema as TableSchema, metadata),
+      metadata,
+      rowCount: t.rowCount,
+      maxRows: t.maxRows,
+      workspaceId: t.workspaceId,
+      createdBy: t.createdBy,
+      archivedAt: t.archivedAt,
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
+    }
+  })
 }
 
 /**
@@ -393,20 +421,18 @@ export async function createTable(
       }
 
       const duplicateName = await trx
-        .select({ id: userTableDefinitions.id, archivedAt: userTableDefinitions.archivedAt })
+        .select({ id: userTableDefinitions.id })
         .from(userTableDefinitions)
         .where(
           and(
             eq(userTableDefinitions.workspaceId, data.workspaceId),
-            eq(userTableDefinitions.name, data.name)
+            eq(userTableDefinitions.name, data.name),
+            isNull(userTableDefinitions.archivedAt)
           )
         )
         .limit(1)
 
       if (duplicateName.length > 0) {
-        if (duplicateName[0].archivedAt) {
-          throw new TableConflictError(data.name)
-        }
         throw new TableConflictError(data.name)
       }
 
@@ -474,71 +500,92 @@ export async function addTableColumn(
   },
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  return withLockedTable(tableId, async (table, trx) => {
+    if (!NAME_PATTERN.test(column.name)) {
+      throw new Error(
+        `Invalid column name "${column.name}". Must start with a letter or underscore and contain only alphanumeric characters and underscores.`
+      )
+    }
 
-  if (!NAME_PATTERN.test(column.name)) {
-    throw new Error(
-      `Invalid column name "${column.name}". Must start with a letter or underscore and contain only alphanumeric characters and underscores.`
-    )
-  }
+    if (column.name.length > TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH) {
+      throw new Error(
+        `Column name exceeds maximum length (${TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH} characters)`
+      )
+    }
 
-  if (column.name.length > TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH) {
-    throw new Error(
-      `Column name exceeds maximum length (${TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH} characters)`
-    )
-  }
+    if (!COLUMN_TYPES.includes(column.type as (typeof COLUMN_TYPES)[number])) {
+      throw new Error(
+        `Invalid column type "${column.type}". Must be one of: ${COLUMN_TYPES.join(', ')}`
+      )
+    }
 
-  if (!COLUMN_TYPES.includes(column.type as (typeof COLUMN_TYPES)[number])) {
-    throw new Error(
-      `Invalid column type "${column.type}". Must be one of: ${COLUMN_TYPES.join(', ')}`
-    )
-  }
+    const schema = table.schema
+    if (schema.columns.some((c) => c.name.toLowerCase() === column.name.toLowerCase())) {
+      throw new Error(`Column "${column.name}" already exists`)
+    }
 
-  const schema = table.schema
-  if (schema.columns.some((c) => c.name.toLowerCase() === column.name.toLowerCase())) {
-    throw new Error(`Column "${column.name}" already exists`)
-  }
+    if (schema.columns.length >= TABLE_LIMITS.MAX_COLUMNS_PER_TABLE) {
+      throw new Error(
+        `Table has reached maximum column limit (${TABLE_LIMITS.MAX_COLUMNS_PER_TABLE})`
+      )
+    }
 
-  if (schema.columns.length >= TABLE_LIMITS.MAX_COLUMNS_PER_TABLE) {
-    throw new Error(
-      `Table has reached maximum column limit (${TABLE_LIMITS.MAX_COLUMNS_PER_TABLE})`
-    )
-  }
+    const newColumn: TableSchema['columns'][number] = {
+      name: column.name,
+      type: column.type as TableSchema['columns'][number]['type'],
+      required: column.required ?? false,
+      unique: column.unique ?? false,
+    }
 
-  const newColumn: TableSchema['columns'][number] = {
-    name: column.name,
-    type: column.type as TableSchema['columns'][number]['type'],
-    required: column.required ?? false,
-    unique: column.unique ?? false,
-  }
+    const columns = [...schema.columns]
+    if (column.position !== undefined && column.position >= 0 && column.position < columns.length) {
+      columns.splice(column.position, 0, newColumn)
+    } else {
+      columns.push(newColumn)
+    }
 
-  const columns = [...schema.columns]
-  if (column.position !== undefined && column.position >= 0 && column.position < columns.length) {
-    columns.splice(column.position, 0, newColumn)
-  } else {
-    columns.push(newColumn)
-  }
+    const updatedSchema: TableSchema = { ...schema, columns }
 
-  const updatedSchema: TableSchema = { ...schema, columns }
-  assertValidSchema(updatedSchema, table.metadata?.columnOrder)
+    // Keep `metadata.columnOrder` in sync: when present, it must list every
+    // column in `schema.columns`. Splicing the new name in at the same index
+    // we used in `columns` keeps display ordering aligned with the user's
+    // intent for `position`-based inserts.
+    const existingOrder = table.metadata?.columnOrder
+    let updatedMetadata = table.metadata
+    if (existingOrder && existingOrder.length > 0 && !existingOrder.includes(column.name)) {
+      let insertIdx = existingOrder.length
+      if (column.position !== undefined && column.position >= 0) {
+        // Anchor on the column previously at `position` — that column shifted
+        // right by one in `columns`, so the new name slots in at its old spot.
+        const anchor = schema.columns[column.position]?.name
+        if (anchor) {
+          const anchorIdx = existingOrder.indexOf(anchor)
+          if (anchorIdx !== -1) insertIdx = anchorIdx
+        }
+      }
+      const nextOrder = [...existingOrder]
+      nextOrder.splice(insertIdx, 0, column.name)
+      updatedMetadata = { ...table.metadata, columnOrder: nextOrder }
+    }
 
-  const now = new Date()
+    assertValidSchema(updatedSchema, updatedMetadata?.columnOrder)
 
-  await db
-    .update(userTableDefinitions)
-    .set({ schema: updatedSchema, updatedAt: now })
-    .where(eq(userTableDefinitions.id, tableId))
+    const now = new Date()
 
-  logger.info(`[${requestId}] Added column "${column.name}" to table ${tableId}`)
+    await trx
+      .update(userTableDefinitions)
+      .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
+      .where(eq(userTableDefinitions.id, tableId))
 
-  return {
-    ...table,
-    schema: updatedSchema,
-    updatedAt: now,
-  }
+    logger.info(`[${requestId}] Added column "${column.name}" to table ${tableId}`)
+
+    return {
+      ...table,
+      schema: updatedSchema,
+      metadata: updatedMetadata,
+      updatedAt: now,
+    }
+  })
 }
 
 /**
@@ -597,7 +644,12 @@ export async function addTableColumnsWithTx(
     )
   }
 
-  const updatedSchema: TableSchema = { columns: [...table.schema.columns, ...additions] }
+  // Spread `table.schema` first so workflow groups (and any future top-level
+  // schema fields) survive a CSV import that only adds plain columns.
+  const updatedSchema: TableSchema = {
+    ...table.schema,
+    columns: [...table.schema.columns, ...additions],
+  }
   const now = new Date()
 
   await trx
@@ -673,9 +725,49 @@ export async function updateTableMetadata(
 ): Promise<TableMetadata> {
   const merged: TableMetadata = { ...(existingMetadata ?? {}), ...metadata }
 
+  // When `columnOrder` is in the patch, scrub any workflow-group dependency
+  // that now sits to the right of (or at the same index as) its group's
+  // leftmost column. Without this, reordering a column could leave a group
+  // depending on a column it can no longer reach in the dag — the group
+  // would never fire.
+  const newOrder = metadata.columnOrder
+  let nextSchema: TableSchema | null = null
+  if (Array.isArray(newOrder) && newOrder.length > 0) {
+    const [tableRow] = await db
+      .select({ schema: userTableDefinitions.schema })
+      .from(userTableDefinitions)
+      .where(eq(userTableDefinitions.id, tableId))
+      .limit(1)
+    if (tableRow) {
+      const schema = tableRow.schema as TableSchema
+      const groups = schema.workflowGroups ?? []
+      if (groups.length > 0) {
+        const positionOf = new Map<string, number>()
+        newOrder.forEach((name, i) => positionOf.set(name, i))
+        let mutated = false
+        const nextGroups = groups.map((group) => {
+          const ownCols = schema.columns.filter((c) => c.workflowGroupId === group.id)
+          let leftmost = Number.POSITIVE_INFINITY
+          for (const c of ownCols) {
+            const idx = positionOf.get(c.name) ?? Number.POSITIVE_INFINITY
+            if (idx < leftmost) leftmost = idx
+          }
+          if (!Number.isFinite(leftmost)) return group
+          const deps = group.dependencies?.columns ?? []
+          const removed = new Set(deps.filter((dep) => (positionOf.get(dep) ?? -1) >= leftmost))
+          if (removed.size === 0) return group
+          const stripped = stripGroupDeps(group, removed)
+          if (stripped !== group) mutated = true
+          return stripped
+        })
+        if (mutated) nextSchema = { ...schema, workflowGroups: nextGroups }
+      }
+    }
+  }
+
   await db
     .update(userTableDefinitions)
-    .set({ metadata: merged })
+    .set(nextSchema ? { metadata: merged, schema: nextSchema } : { metadata: merged })
     .where(eq(userTableDefinitions.id, tableId))
 
   return merged
@@ -694,7 +786,6 @@ export async function deleteTable(tableId: string, requestId: string): Promise<v
     .where(eq(userTableDefinitions.id, tableId))
 
   logger.info(`[${requestId}] Archived table ${tableId}`)
-  notifyTableDeleted(tableId)
 }
 
 /**
@@ -715,13 +806,16 @@ export async function pruneStaleWorkflowGroupOutputs({
   workspaceId,
   validBlockIds,
   requestId,
+  tx,
 }: {
   workflowId: string
   workspaceId: string
   validBlockIds: Set<string>
   requestId: string
+  tx?: DbOrTx
 }): Promise<void> {
-  const tables = await db
+  const executor = tx ?? db
+  const tables = await executor
     .select({
       id: userTableDefinitions.id,
       schema: userTableDefinitions.schema,
@@ -756,7 +850,7 @@ export async function pruneStaleWorkflowGroupOutputs({
 
     if (!mutated) continue
 
-    await db
+    await executor
       .update(userTableDefinitions)
       .set({
         schema: { ...schema, workflowGroups: nextGroups },
@@ -859,7 +953,7 @@ export async function insertRow(
   }
 
   // Validate against schema
-  const schemaValidation = validateRowAgainstSchema(data.data, table.schema)
+  const schemaValidation = coerceRowToSchema(data.data, table.schema)
   if (!schemaValidation.valid) {
     throw new Error(`Schema validation failed: ${schemaValidation.errors.join(', ')}`)
   }
@@ -938,7 +1032,7 @@ export async function insertRow(
   const insertedRow: TableRow = {
     id: row.id,
     data: row.data as RowData,
-    executions: (row.executions as RowExecutions) ?? {},
+    executions: {},
     position: row.position,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -953,8 +1047,14 @@ export async function insertRow(
     table.schema,
     requestId
   )
-  notifyTableRowUpdated(data.tableId, insertedRow)
-  void scheduleWorkflowGroupRuns(table, [insertedRow])
+  void runWorkflowColumn({
+    tableId: table.id,
+    workspaceId: table.workspaceId,
+    rowIds: [insertedRow.id],
+    mode: 'new',
+    isManualRun: false,
+    requestId,
+  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (insertRow) failed:`, err))
 
   return insertedRow
 }
@@ -973,7 +1073,9 @@ export async function batchInsertRows(
   table: TableDefinition,
   requestId: string
 ): Promise<TableRow[]> {
-  return db.transaction((trx) => batchInsertRowsWithTx(trx, data, table, requestId))
+  const result = await db.transaction((trx) => batchInsertRowsWithTx(trx, data, table, requestId))
+  dispatchAfterBatchInsert(table, result, requestId)
+  return result
 }
 
 /**
@@ -1000,7 +1102,7 @@ export async function batchInsertRowsWithTx(
       throw new Error(`Row ${i + 1}: ${sizeValidation.errors.join(', ')}`)
     }
 
-    const schemaValidation = validateRowAgainstSchema(row, table.schema)
+    const schemaValidation = coerceRowToSchema(row, table.schema)
     if (!schemaValidation.valid) {
       throw new Error(`Row ${i + 1}: ${schemaValidation.errors.join(', ')}`)
     }
@@ -1065,17 +1167,39 @@ export async function batchInsertRowsWithTx(
   const result: TableRow[] = insertedRows.map((r) => ({
     id: r.id,
     data: r.data as RowData,
-    executions: (r.executions as RowExecutions) ?? {},
+    executions: {},
     position: r.position,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   }))
 
-  void fireTableTrigger(data.tableId, table.name, 'insert', result, null, table.schema, requestId)
-  for (const row of result) notifyTableRowUpdated(data.tableId, row)
-  void scheduleWorkflowGroupRuns(table, result)
-
   return result
+}
+
+/**
+ * Side-effect dispatch for an insert batch. Caller fires this AFTER the
+ * surrounding transaction commits — `fireTableTrigger` and `runWorkflowColumn`
+ * both read through the global db connection, so firing inside the tx can see
+ * no rows and no-op.
+ */
+export function dispatchAfterBatchInsert(
+  table: TableDefinition,
+  result: TableRow[],
+  requestId: string
+): void {
+  void fireTableTrigger(table.id, table.name, 'insert', result, null, table.schema, requestId)
+  // Scope to the newly-inserted row ids so the dispatcher doesn't walk every
+  // row in the table. After the sidecar migration, all existing rows have
+  // zero entries → `mode:'new'`'s `NOT EXISTS` filter would otherwise include
+  // them, dispatching workflows on every row in a populated table.
+  void runWorkflowColumn({
+    tableId: table.id,
+    workspaceId: table.workspaceId,
+    rowIds: result.map((r) => r.id),
+    mode: 'new',
+    isManualRun: false,
+    requestId,
+  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (batchInsertRows) failed:`, err))
 }
 
 /**
@@ -1131,7 +1255,7 @@ export async function replaceTableRowsWithTx(
       throw new Error(`Row ${i + 1}: ${sizeValidation.errors.join(', ')}`)
     }
 
-    const schemaValidation = validateRowAgainstSchema(row, table.schema)
+    const schemaValidation = coerceRowToSchema(row, table.schema)
     if (!schemaValidation.valid) {
       throw new Error(`Row ${i + 1}: ${schemaValidation.errors.join(', ')}`)
     }
@@ -1261,32 +1385,30 @@ export async function upsertRow(
     )
   }
 
-  const targetValue = data.data[targetColumnName]
-  if (targetValue === undefined || targetValue === null) {
-    throw new Error(`Upsert requires a value for the conflict target column "${targetColumnName}"`)
-  }
-
   // Validate row data
   const sizeValidation = validateRowSize(data.data)
   if (!sizeValidation.valid) {
     throw new Error(sizeValidation.errors.join(', '))
   }
 
-  const schemaValidation = validateRowAgainstSchema(data.data, schema)
+  const schemaValidation = coerceRowToSchema(data.data, schema)
   if (!schemaValidation.valid) {
     throw new Error(`Schema validation failed: ${schemaValidation.errors.join(', ')}`)
   }
 
-  // Validate column name before raw interpolation (defense-in-depth)
-  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(targetColumnName)) {
-    throw new Error(`Invalid column name: ${targetColumnName}`)
+  // Read the conflict-target value *after* coercion so `matchFilter` branches on
+  // the persisted type (e.g. a coerced `"123"` → `123` matches existing rows).
+  const targetValue = data.data[targetColumnName]
+  if (targetValue === undefined || targetValue === null) {
+    throw new Error(`Upsert requires a value for the conflict target column "${targetColumnName}"`)
   }
 
-  // Build the single-column match filter
+  // `data->` and `data->>` accept the JSON key as a parameterized text value;
+  // no need for `sql.raw` interpolation.
   const matchFilter =
     typeof targetValue === 'string'
-      ? sql`${userTableRows.data}->>${sql.raw(`'${targetColumnName}'`)} = ${String(targetValue)}`
-      : sql`(${userTableRows.data}->${sql.raw(`'${targetColumnName}'`)})::jsonb = ${JSON.stringify(targetValue)}::jsonb`
+      ? sql`${userTableRows.data}->>${targetColumnName}::text = ${String(targetValue)}`
+      : sql`(${userTableRows.data}->${targetColumnName}::text)::jsonb = ${JSON.stringify(targetValue)}::jsonb`
 
   // Capacity enforcement for the insert path lives in the `increment_user_table_row_count`
   // trigger (migration 0198). The update path doesn't change row_count, so no check needed.
@@ -1351,11 +1473,12 @@ export async function upsertRow(
         .where(eq(userTableRows.id, matchedRowId))
         .returning()
 
+      const executions = await loadExecutionsForRow(trx, updatedRow.id)
       return {
         row: {
           id: updatedRow.id,
           data: updatedRow.data as RowData,
-          executions: (updatedRow.executions as RowExecutions) ?? {},
+          executions,
           position: updatedRow.position,
           createdAt: updatedRow.createdAt,
           updatedAt: updatedRow.updatedAt,
@@ -1383,7 +1506,7 @@ export async function upsertRow(
       row: {
         id: insertedRow.id,
         data: insertedRow.data as RowData,
-        executions: (insertedRow.executions as RowExecutions) ?? {},
+        executions: {},
         position: insertedRow.position,
         createdAt: insertedRow.createdAt,
         updatedAt: insertedRow.updatedAt,
@@ -1418,8 +1541,14 @@ export async function upsertRow(
       requestId
     )
   }
-  notifyTableRowUpdated(data.tableId, result.row)
-  void scheduleWorkflowGroupRuns(table, [result.row])
+  void runWorkflowColumn({
+    tableId: table.id,
+    workspaceId: table.workspaceId,
+    rowIds: [result.row.id],
+    mode: 'new',
+    isManualRun: false,
+    requestId,
+  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (upsertRow) failed:`, err))
 
   return result
 }
@@ -1435,15 +1564,13 @@ export async function upsertRow(
  * (bounded only by the btree on `table_id`). Prefer equality on hot paths; set
  * `includeTotal: false` when the caller does not need the `COUNT(*)`.
  *
- * @param tableId - Table ID to query
- * @param workspaceId - Workspace ID for access control
+ * @param table - Table definition (provides id, workspaceId, and column schema for type-aware filter/sort casts)
  * @param options - Query options (filter, sort, limit, offset)
  * @param requestId - Request ID for logging
  * @returns Query result with rows and pagination info
  */
 export async function queryRows(
-  tableId: string,
-  workspaceId: string,
+  table: TableDefinition,
   options: QueryOptions,
   requestId: string
 ): Promise<QueryResult> {
@@ -1456,16 +1583,17 @@ export async function queryRows(
   } = options
 
   const tableName = USER_TABLE_ROWS_SQL_NAME
+  const columns = table.schema.columns
 
   // Build WHERE clause
   const baseConditions = and(
-    eq(userTableRows.tableId, tableId),
-    eq(userTableRows.workspaceId, workspaceId)
+    eq(userTableRows.tableId, table.id),
+    eq(userTableRows.workspaceId, table.workspaceId)
   )
 
   let whereClause = baseConditions
   if (filter && Object.keys(filter).length > 0) {
-    const filterClause = buildFilterClause(filter, tableName)
+    const filterClause = buildFilterClause(filter, tableName, columns)
     if (filterClause) {
       whereClause = and(baseConditions, filterClause)
     }
@@ -1483,7 +1611,7 @@ export async function queryRows(
   // Build ORDER BY clause (default to position ASC for stable ordering)
   let orderByClause
   if (sort && Object.keys(sort).length > 0) {
-    orderByClause = buildSortClause(sort, tableName)
+    orderByClause = buildSortClause(sort, tableName, columns)
   }
 
   // Execute query
@@ -1501,14 +1629,19 @@ export async function queryRows(
   const rows = await query.limit(limit).offset(offset)
 
   logger.info(
-    `[${requestId}] Queried ${rows.length} rows from table ${tableId} (total: ${totalCount})`
+    `[${requestId}] Queried ${rows.length} rows from table ${table.id} (total: ${totalCount})`
+  )
+
+  const executionsByRow = await loadExecutionsByRow(
+    db,
+    rows.map((r) => r.id)
   )
 
   return {
     rows: rows.map((r) => ({
       id: r.id,
       data: r.data as RowData,
-      executions: (r.executions as RowExecutions) ?? {},
+      executions: executionsByRow.get(r.id) ?? {},
       position: r.position,
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
@@ -1548,13 +1681,113 @@ export async function getRowById(
   if (results.length === 0) return null
 
   const row = results[0]
+  const executions = await loadExecutionsForRow(db, row.id)
   return {
     id: row.id,
     data: row.data as RowData,
-    executions: (row.executions as RowExecutions) ?? {},
+    executions,
     position: row.position,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  }
+}
+
+/**
+ * Derive automatic clears + cancellation candidates from a row's data patch.
+ *
+ * Walks `schema.workflowGroups` left-to-right with a propagating `dirtied`
+ * column set. For each group whose deps overlap the dirty set, decide to
+ * clear (terminal exec) or cancel+rerun (in-flight exec), then add the
+ * group's outputs to the dirty set so later groups in the chain see them
+ * as dirty too. This models transitive dep chains as a single forward pass —
+ * editing column A propagates through group 1 (deps on A) to group 2 (deps
+ * on group 1's output) without explicit DAG traversal.
+ *
+ * Returns:
+ * - `executionsPatch`: caller's patch + nulls for cleared groups (or
+ *   undefined if nothing applied).
+ * - `inFlightDownstreamGroups`: groups whose dep was dirtied and that are
+ *   currently in-flight. Cancel-and-restart is the caller's job.
+ *
+ * Assumption: `workflowGroups[]` is in topological order — a group's deps
+ * may only reference columns to its left (enforced by `workflow-sidebar`'s
+ * "Run after" picker + the reorder scrub via `stripGroupDeps`). Violating
+ * this would silently miss the propagation.
+ */
+function deriveExecClearsForDataPatch(
+  dataPatch: RowData,
+  schema: TableSchema,
+  existingExecutions: RowExecutions,
+  callerPatch: Record<string, RowExecutionMetadata | null> | undefined,
+  mergedData: RowData
+): {
+  executionsPatch: Record<string, RowExecutionMetadata | null> | undefined
+  inFlightDownstreamGroups: string[]
+} {
+  const dirtied = new Set(Object.keys(dataPatch))
+  const groupsToClear = new Set<string>()
+  const inFlightDownstreamGroups: string[] = []
+
+  // Own-output clears: when the user wipes a workflow output column, drop
+  // that group's exec entry so the auto-fire reactor re-arms the cell.
+  // Also flags the cleared output column as dirty so transitive downstream
+  // groups see it.
+  for (const [columnName, value] of Object.entries(dataPatch)) {
+    const cleared = value === null || value === undefined || value === ''
+    if (!cleared) continue
+    const col = schema.columns.find((c) => c.name === columnName)
+    if (col?.workflowGroupId) groupsToClear.add(col.workflowGroupId)
+  }
+
+  // Left-to-right walk, propagating dirty columns forward.
+  const groups = schema.workflowGroups ?? []
+  const afterRow = { data: mergedData } as TableRow
+  for (const group of groups) {
+    const deps = group.dependencies?.columns ?? []
+    const depMatched = deps.some((d) => dirtied.has(d))
+    if (!depMatched) continue
+
+    // A dep column changed, but if the group's deps are no longer satisfied
+    // after the patch — a checkbox was unchecked or a text dep cleared — there's
+    // nothing to recompute. Leave the prior result alone instead of re-arming or
+    // cancelling it; only checking a box / filling a dep drives downstream work.
+    if (!areGroupDepsSatisfied(group, afterRow)) continue
+
+    const exec = existingExecutions[group.id]
+    if (exec) {
+      const status = exec.status
+      if (status === 'completed' || status === 'error' || status === 'cancelled') {
+        groupsToClear.add(group.id)
+      } else if (status === 'queued' || status === 'running' || status === 'pending') {
+        inFlightDownstreamGroups.push(group.id)
+      }
+    } else {
+      // No exec entry yet — `mode: 'new'` already covers this group. We
+      // still propagate the dirty signal forward so later groups in the
+      // chain see this group's outputs as dirty too.
+      groupsToClear.add(group.id)
+    }
+
+    // Propagate: this group is about to be re-computed, so groups whose
+    // deps reference its output columns are also dirty.
+    for (const out of group.outputs) dirtied.add(out.columnName)
+  }
+
+  if (groupsToClear.size === 0) {
+    return { executionsPatch: callerPatch, inFlightDownstreamGroups }
+  }
+  const merged: Record<string, RowExecutionMetadata | null> = { ...(callerPatch ?? {}) }
+  for (const gid of groupsToClear) {
+    if (!(gid in merged)) merged[gid] = null
+  }
+  return { executionsPatch: merged, inFlightDownstreamGroups }
+}
+
+/** Internal: thrown inside `db.transaction` to roll back when the executions
+ *  guard rejects a write. The outer `.catch` translates it into a `null` return. */
+class GuardRejected extends Error {
+  constructor() {
+    super('cell-write guard rejected')
   }
 }
 
@@ -1573,6 +1806,178 @@ function applyExecutionsPatch(
     }
   }
   return next
+}
+
+/**
+ * Loads `tableRowExecutions` rows for the given row ids and groups them into
+ * a `Map<rowId, RowExecutions>` suitable for plugging into `TableRow.executions`
+ * everywhere callers used to read `userTableRows.executions` JSONB.
+ */
+async function loadExecutionsByRow(
+  trx: DbOrTx,
+  rowIds: Iterable<string>
+): Promise<Map<string, RowExecutions>> {
+  const ids = Array.from(new Set(rowIds))
+  const result = new Map<string, RowExecutions>()
+  if (ids.length === 0) return result
+  const rows = await trx
+    .select()
+    .from(tableRowExecutions)
+    .where(inArray(tableRowExecutions.rowId, ids))
+  for (const r of rows) {
+    const existing = result.get(r.rowId) ?? {}
+    const meta: RowExecutionMetadata = {
+      status: r.status as RowExecutionMetadata['status'],
+      executionId: r.executionId ?? null,
+      jobId: r.jobId ?? null,
+      workflowId: r.workflowId,
+      error: r.error ?? null,
+      ...(r.runningBlockIds && r.runningBlockIds.length > 0
+        ? { runningBlockIds: r.runningBlockIds }
+        : {}),
+      ...(r.blockErrors && Object.keys(r.blockErrors as Record<string, string>).length > 0
+        ? { blockErrors: r.blockErrors as Record<string, string> }
+        : {}),
+      ...(r.cancelledAt ? { cancelledAt: r.cancelledAt.toISOString() } : {}),
+    }
+    existing[r.groupId] = meta
+    result.set(r.rowId, existing)
+  }
+  return result
+}
+
+/** Convenience: load executions for one row, returning `{}` when missing. */
+async function loadExecutionsForRow(trx: DbOrTx, rowId: string): Promise<RowExecutions> {
+  const byRow = await loadExecutionsByRow(trx, [rowId])
+  return byRow.get(rowId) ?? {}
+}
+
+/**
+ * Writes a per-group execution patch for one row against the `tableRowExecutions`
+ * sidecar. Non-null values upsert into the table; nulls delete the entry. When
+ * `guard` is set, the upsert is gated to:
+ *  - reject if a `cancelled` row for the same execution already exists, and
+ *  - reject if the row exists but is owned by a different executionId
+ *    (with carve-outs for missing rows and null executionIds — the dispatcher's
+ *    pre-batch `pending` stamp leaves executionId unset so the first cell-task
+ *    can claim).
+ *
+ * Returns `'guard-rejected'` when the guarded group's upsert affected 0 rows
+ * (callers signal failure to the cell-task path). Returns `'wrote'` otherwise.
+ */
+async function writeExecutionsPatch(
+  trx: DbOrTx,
+  tableId: string,
+  rowId: string,
+  patch: Record<string, RowExecutionMetadata | null> | undefined,
+  guard?: { groupId: string; executionId: string }
+): Promise<'wrote' | 'guard-rejected'> {
+  if (!patch) return 'wrote'
+  const entries = Object.entries(patch)
+  if (entries.length === 0) return 'wrote'
+
+  for (const [gid, value] of entries) {
+    if (value === null) {
+      await trx
+        .delete(tableRowExecutions)
+        .where(and(eq(tableRowExecutions.rowId, rowId), eq(tableRowExecutions.groupId, gid)) as SQL)
+      continue
+    }
+    const insertValues = {
+      tableId,
+      rowId,
+      groupId: gid,
+      status: value.status,
+      executionId: value.executionId,
+      jobId: value.jobId,
+      workflowId: value.workflowId,
+      error: value.error,
+      runningBlockIds: value.runningBlockIds ?? [],
+      blockErrors: value.blockErrors ?? {},
+      cancelledAt: value.cancelledAt ? new Date(value.cancelledAt) : null,
+      updatedAt: new Date(),
+    } as const
+
+    const isGuarded = guard && guard.groupId === gid
+    if (isGuarded) {
+      // Gate by guard semantics. The original JSONB guard had two AND'd
+      // clauses; we collapse them onto the upsert's WHERE so a non-matching
+      // existing row leaves the table untouched and we observe 0 affected.
+      const guardExecutionId = guard.executionId
+      const updated = await trx
+        .insert(tableRowExecutions)
+        .values(insertValues)
+        .onConflictDoUpdate({
+          target: [tableRowExecutions.rowId, tableRowExecutions.groupId],
+          set: {
+            status: insertValues.status,
+            executionId: insertValues.executionId,
+            jobId: insertValues.jobId,
+            workflowId: insertValues.workflowId,
+            error: insertValues.error,
+            runningBlockIds: insertValues.runningBlockIds,
+            blockErrors: insertValues.blockErrors,
+            cancelledAt: insertValues.cancelledAt,
+            updatedAt: insertValues.updatedAt,
+          },
+          where: and(
+            // Reject any guarded worker write when the cell is `cancelled` — a
+            // stop click wrote it authoritatively. SQL mirror of `isExecCancelled`
+            // (deps.ts). Status-only (not executionId-scoped): the cancel can
+            // only carry the pre-stamp's executionId (often null), so matching on
+            // id would let the worker's real-id claim resurrect a killed cell.
+            sql`${tableRowExecutions.status} <> 'cancelled'`,
+            // Stale-worker: the cell's active run has moved on. Carve-outs
+            // permit a fresh worker to take over when the row's executionId
+            // is unset (dispatcher's pre-batch `pending` stamp).
+            sql`(${tableRowExecutions.executionId} IS NULL OR ${tableRowExecutions.executionId} = ${guardExecutionId})`
+          ) as SQL,
+        })
+        .returning({ rowId: tableRowExecutions.rowId })
+      if (updated.length === 0) return 'guard-rejected'
+      continue
+    }
+
+    await trx
+      .insert(tableRowExecutions)
+      .values(insertValues)
+      .onConflictDoUpdate({
+        target: [tableRowExecutions.rowId, tableRowExecutions.groupId],
+        set: {
+          status: insertValues.status,
+          executionId: insertValues.executionId,
+          jobId: insertValues.jobId,
+          workflowId: insertValues.workflowId,
+          error: insertValues.error,
+          runningBlockIds: insertValues.runningBlockIds,
+          blockErrors: insertValues.blockErrors,
+          cancelledAt: insertValues.cancelledAt,
+          updatedAt: insertValues.updatedAt,
+        },
+      })
+  }
+
+  return 'wrote'
+}
+
+/**
+ * Strips the given workflow group ids from every row's executions on a table —
+ * used by the column / group delete paths so stale running/queued exec records
+ * don't linger and inflate counters after the group is gone. The caller wraps
+ * in their own transaction.
+ */
+async function stripGroupExecutions(
+  trx: DbOrTx,
+  tableId: string,
+  groupIds: Iterable<string>
+): Promise<void> {
+  const ids = Array.from(new Set(groupIds))
+  if (ids.length === 0) return
+  await trx
+    .delete(tableRowExecutions)
+    .where(
+      and(eq(tableRowExecutions.tableId, tableId), inArray(tableRowExecutions.groupId, ids)) as SQL
+    )
 }
 
 /**
@@ -1600,7 +2005,18 @@ export async function updateRow(
     ...(existingRow.data as RowData),
     ...data.data,
   }
-  const mergedExecutions = applyExecutionsPatch(existingRow.executions, data.executionsPatch)
+  // Auto-clear exec records for workflow output columns the user just wiped
+  // AND for downstream groups whose deps just changed. Surfaces the in-flight
+  // downstream groups so the caller can cancel + re-run them.
+  const { executionsPatch: effectiveExecutionsPatch, inFlightDownstreamGroups } =
+    deriveExecClearsForDataPatch(
+      data.data,
+      table.schema,
+      existingRow.executions,
+      data.executionsPatch,
+      mergedData
+    )
+  const mergedExecutions = applyExecutionsPatch(existingRow.executions, effectiveExecutionsPatch)
 
   // Validate size
   const sizeValidation = validateRowSize(mergedData)
@@ -1609,7 +2025,7 @@ export async function updateRow(
   }
 
   // Validate against schema
-  const schemaValidation = validateRowAgainstSchema(mergedData, table.schema)
+  const schemaValidation = coerceRowToSchema(mergedData, table.schema)
   if (!schemaValidation.valid) {
     throw new Error(`Schema validation failed: ${schemaValidation.errors.join(', ')}`)
   }
@@ -1630,32 +2046,40 @@ export async function updateRow(
 
   const now = new Date()
 
-  // Cell-task partial writes pass `cancellationGuard` so the SQL update is a
-  // no-op when a stop click already wrote `cancelled` for this run between
-  // the in-process read and now. Without this, an in-flight `running`
-  // partial-write can land after `cancelled` and clobber it.
+  // Cell-task partial writes pass `cancellationGuard` so the upsert into
+  // `tableRowExecutions` is a no-op when (a) a stop click already wrote
+  // `cancelled` for this run, or (b) a newer run has taken over the cell
+  // with a different executionId. Authoritative cancel writes from
+  // `cancelWorkflowGroupRuns` skip the guard entirely. Data + executions
+  // commit in one transaction so a partial write can't leave the sidecar
+  // and the row out of sync.
   const guard = data.cancellationGuard
-  // The guard rejects writes only when the DB *already* shows
-  // `cancelled` + matching executionId. Wrap the JSON traversals in
-  // `IS DISTINCT FROM` so a missing `executions[groupId]` (NULL) cleanly
-  // evaluates as "different" — Postgres three-valued logic would otherwise
-  // make the whole expression NULL and the UPDATE would mistakenly become
-  // a no-op for any row that has no prior execution record.
-  const whereClause = guard
-    ? and(
-        eq(userTableRows.id, data.rowId),
-        sql`(executions->${guard.groupId}->>'status' IS DISTINCT FROM 'cancelled' OR executions->${guard.groupId}->>'executionId' IS DISTINCT FROM ${guard.executionId})`
+  const guardRejected = await db
+    .transaction(async (trx) => {
+      await trx
+        .update(userTableRows)
+        .set({ data: mergedData, updatedAt: now })
+        .where(eq(userTableRows.id, data.rowId))
+
+      const result = await writeExecutionsPatch(
+        trx,
+        data.tableId,
+        data.rowId,
+        effectiveExecutionsPatch,
+        guard
       )
-    : eq(userTableRows.id, data.rowId)
+      if (result === 'guard-rejected') {
+        // Roll back the data update too — the worker isn't authoritative.
+        throw new GuardRejected()
+      }
+      return false
+    })
+    .catch((err) => {
+      if (err instanceof GuardRejected) return true
+      throw err
+    })
 
-  const updated = await db
-    .update(userTableRows)
-    .set({ data: mergedData, executions: mergedExecutions, updatedAt: now })
-    .where(whereClause)
-    .returning({ id: userTableRows.id })
-
-  // Only meaningful when a guard is set — `null` signals "guard rejected".
-  if (guard && updated.length === 0) {
+  if (guardRejected) {
     return null
   }
 
@@ -1680,15 +2104,54 @@ export async function updateRow(
     table.schema,
     requestId
   )
-  // Notify BEFORE the scheduler so this event (carrying the user's data
-  // update with pre-scheduler executions) reaches the client first. The
-  // scheduler then fires its own per-write notifications with `pending`/
-  // `running` execution state — those land last, so the cached executions
-  // end on the live state instead of being clobbered by a stale envelope.
-  notifyTableRowUpdated(data.tableId, updatedRow)
-  // Awaited (not `void`) so cell tasks dispatch their cascade before the
-  // trigger.dev worker tears down on `run()` resolve.
-  await scheduleWorkflowGroupRuns(table, [updatedRow])
+
+  // Auto-fire only on user-facing data edits. Internal callers that mutate
+  // executions (cell-task partial/terminal writes, cancel writes) always pass
+  // `executionsPatch` — re-dispatching from those would recursively spawn new
+  // dispatches for every running/terminal write, flooding the dispatcher with
+  // redundant pre-stamps that strand `pending` cells.
+  const isInternalExecWrite = data.executionsPatch && Object.keys(data.executionsPatch).length > 0
+  if (isInternalExecWrite) {
+    return updatedRow
+  }
+
+  // Two passes:
+  //  1. Cancel in-flight downstream groups whose dep just changed, then
+  //     manually re-run them — the cancel writes `cancelled` per cell and
+  //     `mode: 'incomplete' + isManualRun: true` wipes those entries and
+  //     re-enqueues.
+  //  2. `mode: 'new'` for groups that just had their exec entries cleared
+  //     (own-output wipe OR terminal downstream dep-changed) — the
+  //     dispatcher's `jsonb_exists_all` SQL filter lets the row through
+  //     because at least one targeted group's exec is now missing.
+  if (inFlightDownstreamGroups.length > 0) {
+    void (async () => {
+      try {
+        await cancelWorkflowGroupRuns(data.tableId, data.rowId, {
+          groupIds: inFlightDownstreamGroups,
+        })
+        await runWorkflowColumn({
+          tableId: data.tableId,
+          workspaceId: data.workspaceId,
+          mode: 'incomplete',
+          isManualRun: true,
+          rowIds: [data.rowId],
+          groupIds: inFlightDownstreamGroups,
+          requestId,
+        })
+      } catch (err) {
+        logger.error(`[${requestId}] cancel+rerun for in-flight downstream groups failed:`, err)
+      }
+    })()
+  }
+  void runWorkflowColumn({
+    tableId: data.tableId,
+    workspaceId: data.workspaceId,
+    rowIds: [data.rowId],
+    mode: 'new',
+    isManualRun: false,
+    requestId,
+  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (updateRow) failed:`, err))
 
   return updatedRow
 }
@@ -1730,32 +2193,31 @@ export async function deleteRow(
   })
 
   logger.info(`[${requestId}] Deleted row ${rowId} from table ${tableId}`)
-  notifyTableRowDeleted(tableId, rowId)
 }
 
 /**
  * Updates multiple rows matching a filter.
  *
+ * @param table - Table definition (provides column schema for type-aware filter casts)
  * @param data - Bulk update data
- * @param table - Table definition
  * @param requestId - Request ID for logging
  * @returns Bulk operation result
  */
 export async function updateRowsByFilter(
-  data: BulkUpdateData,
   table: TableDefinition,
+  data: BulkUpdateData,
   requestId: string
 ): Promise<BulkOperationResult> {
   const tableName = USER_TABLE_ROWS_SQL_NAME
 
-  const filterClause = buildFilterClause(data.filter, tableName)
+  const filterClause = buildFilterClause(data.filter, tableName, table.schema.columns)
   if (!filterClause) {
     throw new Error('Filter is required for bulk update')
   }
 
   const baseConditions = and(
-    eq(userTableRows.tableId, data.tableId),
-    eq(userTableRows.workspaceId, data.workspaceId)
+    eq(userTableRows.tableId, table.id),
+    eq(userTableRows.workspaceId, table.workspaceId)
   )
 
   let query = db
@@ -1773,6 +2235,12 @@ export async function updateRowsByFilter(
     return { affectedCount: 0, affectedRowIds: [] }
   }
 
+  // Coerce the patch itself in place — the write below persists `data.data`
+  // (as `patchJson`), so coercing only the per-row merged copies would be
+  // discarded. The merged validation in the loop still enforces required
+  // fields against the full row.
+  coerceRowValues(data.data, table.schema)
+
   for (const row of matchingRows) {
     const existingData = row.data as RowData
     const mergedData = { ...existingData, ...data.data }
@@ -1782,7 +2250,7 @@ export async function updateRowsByFilter(
       throw new Error(`Row ${row.id}: ${sizeValidation.errors.join(', ')}`)
     }
 
-    const schemaValidation = validateRowAgainstSchema(mergedData, table.schema)
+    const schemaValidation = coerceRowToSchema(mergedData, table.schema)
     if (!schemaValidation.valid) {
       throw new Error(`Row ${row.id}: ${schemaValidation.errors.join(', ')}`)
     }
@@ -1803,7 +2271,7 @@ export async function updateRowsByFilter(
     const row = matchingRows[0]
     const mergedData = { ...(row.data as RowData), ...data.data }
     const uniqueValidation = await checkUniqueConstraintsDb(
-      data.tableId,
+      table.id,
       mergedData,
       table.schema,
       row.id
@@ -1831,19 +2299,19 @@ export async function updateRowsByFilter(
     }
   })
 
-  logger.info(`[${requestId}] Updated ${matchingRows.length} rows in table ${data.tableId}`)
+  logger.info(`[${requestId}] Updated ${matchingRows.length} rows in table ${table.id}`)
 
   const oldRows = new Map(matchingRows.map((r) => [r.id, r.data as RowData]))
   const updatedRows: TableRow[] = matchingRows.map((r) => ({
     id: r.id,
     data: { ...(r.data as RowData), ...data.data },
-    executions: ((r as { executions?: unknown }).executions as RowExecutions) ?? {},
+    executions: {},
     position: 0,
     createdAt: now,
     updatedAt: now,
   }))
   void fireTableTrigger(
-    data.tableId,
+    table.id,
     table.name,
     'update',
     updatedRows,
@@ -1851,8 +2319,14 @@ export async function updateRowsByFilter(
     table.schema,
     requestId
   )
-  for (const row of updatedRows) notifyTableRowUpdated(data.tableId, row)
-  void scheduleWorkflowGroupRuns(table, updatedRows)
+  void runWorkflowColumn({
+    tableId: table.id,
+    workspaceId: table.workspaceId,
+    rowIds: updatedRows.map((r) => r.id),
+    mode: 'new',
+    isManualRun: false,
+    requestId,
+  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (updateRowsByFilter) failed:`, err))
 
   return {
     affectedCount: matchingRows.length,
@@ -1878,7 +2352,6 @@ export async function batchUpdateRows(
     .select({
       id: userTableRows.id,
       data: userTableRows.data,
-      executions: userTableRows.executions,
     })
     .from(userTableRows)
     .where(
@@ -1889,11 +2362,16 @@ export async function batchUpdateRows(
       )
     )
 
+  const executionsByRow = await loadExecutionsByRow(
+    db,
+    existingRows.map((r) => r.id)
+  )
+
   type ExistingRow = { data: RowData; executions: RowExecutions }
   const existingMap = new Map<string, ExistingRow>(
     existingRows.map((r) => [
       r.id,
-      { data: r.data as RowData, executions: (r.executions as RowExecutions) ?? {} },
+      { data: r.data as RowData, executions: executionsByRow.get(r.id) ?? {} },
     ])
   )
 
@@ -1906,23 +2384,43 @@ export async function batchUpdateRows(
     rowId: string
     mergedData: RowData
     mergedExecutions: RowExecutions
+    executionsPatch?: Record<string, RowExecutionMetadata | null>
+    inFlightDownstreamGroups: string[]
   }> = []
   for (const update of data.updates) {
     const existing = existingMap.get(update.rowId)!
     const merged = { ...existing.data, ...update.data }
-    const mergedExecutions = applyExecutionsPatch(existing.executions, update.executionsPatch)
+    // Auto-clear exec records for workflow output columns the user just
+    // wiped AND downstream dep-changed terminal groups — same rationale as
+    // `updateRow`. Per-row in-flight downstream groups are surfaced so we
+    // can run the cancel+rerun orchestration after the batch commits.
+    const { executionsPatch: effectiveExecutionsPatch, inFlightDownstreamGroups } =
+      deriveExecClearsForDataPatch(
+        update.data,
+        table.schema,
+        existing.executions,
+        update.executionsPatch,
+        merged
+      )
+    const mergedExecutions = applyExecutionsPatch(existing.executions, effectiveExecutionsPatch)
 
     const sizeValidation = validateRowSize(merged)
     if (!sizeValidation.valid) {
       throw new Error(`Row ${update.rowId}: ${sizeValidation.errors.join(', ')}`)
     }
 
-    const schemaValidation = validateRowAgainstSchema(merged, table.schema)
+    const schemaValidation = coerceRowToSchema(merged, table.schema)
     if (!schemaValidation.valid) {
       throw new Error(`Row ${update.rowId}: ${schemaValidation.errors.join(', ')}`)
     }
 
-    mergedUpdates.push({ rowId: update.rowId, mergedData: merged, mergedExecutions })
+    mergedUpdates.push({
+      rowId: update.rowId,
+      mergedData: merged,
+      mergedExecutions,
+      executionsPatch: effectiveExecutionsPatch,
+      inFlightDownstreamGroups,
+    })
   }
 
   const uniqueColumns = getUniqueColumns(table.schema)
@@ -1946,13 +2444,18 @@ export async function batchUpdateRows(
     await setTableTxTimeouts(trx, { statementMs: 60_000 })
     for (let i = 0; i < mergedUpdates.length; i += TABLE_LIMITS.UPDATE_BATCH_SIZE) {
       const batch = mergedUpdates.slice(i, i + TABLE_LIMITS.UPDATE_BATCH_SIZE)
-      const updatePromises = batch.map(({ rowId, mergedData, mergedExecutions }) =>
+      // Update row data in parallel; sidecar exec writes are sequential per
+      // row (each goes through writeExecutionsPatch's per-key upsert).
+      const dataPromises = batch.map(({ rowId, mergedData }) =>
         trx
           .update(userTableRows)
-          .set({ data: mergedData, executions: mergedExecutions, updatedAt: now })
+          .set({ data: mergedData, updatedAt: now })
           .where(eq(userTableRows.id, rowId))
       )
-      await Promise.all(updatePromises)
+      await Promise.all(dataPromises)
+      for (const { rowId, executionsPatch } of batch) {
+        await writeExecutionsPatch(trx, data.tableId, rowId, executionsPatch)
+      }
     }
   })
 
@@ -1980,11 +2483,47 @@ export async function batchUpdateRows(
     table.schema,
     requestId
   )
-  // Same ordering as `updateRow`: notify with the user's data update first
-  // so the scheduler's later per-write notifications (pending/running) land
-  // last and stick in the client cache.
-  for (const row of updatedRowsForTrigger) notifyTableRowUpdated(data.tableId, row)
-  void scheduleWorkflowGroupRuns(table, updatedRowsForTrigger)
+  // Per-row cancel+rerun for in-flight downstream groups whose deps just
+  // changed — same orchestration as single-row `updateRow`. Without this,
+  // batch updates would leave running workflows reading stale dep values.
+  // Each row needs its own cancel + manual-incomplete dispatch because
+  // `cancelWorkflowGroupRuns`'s `groupIds` filter is per-row.
+  const rowsWithInFlightDownstream = mergedUpdates.filter(
+    (u) => u.inFlightDownstreamGroups.length > 0
+  )
+  if (rowsWithInFlightDownstream.length > 0) {
+    void (async () => {
+      try {
+        for (const { rowId, inFlightDownstreamGroups } of rowsWithInFlightDownstream) {
+          await cancelWorkflowGroupRuns(data.tableId, rowId, {
+            groupIds: inFlightDownstreamGroups,
+          })
+          await runWorkflowColumn({
+            tableId: data.tableId,
+            workspaceId: data.workspaceId,
+            mode: 'incomplete',
+            isManualRun: true,
+            rowIds: [rowId],
+            groupIds: inFlightDownstreamGroups,
+            requestId,
+          })
+        }
+      } catch (err) {
+        logger.error(
+          `[${requestId}] cancel+rerun for in-flight downstream groups (batch) failed:`,
+          err
+        )
+      }
+    })()
+  }
+  void runWorkflowColumn({
+    tableId: table.id,
+    workspaceId: table.workspaceId,
+    rowIds: updatedRowsForTrigger.map((r) => r.id),
+    mode: 'new',
+    isManualRun: false,
+    requestId,
+  }).catch((err) => logger.error(`[${requestId}] auto-dispatch (batchUpdateRows) failed:`, err))
 
   return {
     affectedCount: mergedUpdates.length,
@@ -2032,26 +2571,28 @@ async function recompactPositions(tableId: string, trx: DbTransaction, minDelete
 /**
  * Deletes multiple rows matching a filter.
  *
+ * @param table - Table definition (provides column schema for type-aware filter casts)
  * @param data - Bulk delete data
  * @param requestId - Request ID for logging
  * @returns Bulk operation result
  */
 export async function deleteRowsByFilter(
+  table: TableDefinition,
   data: BulkDeleteData,
   requestId: string
 ): Promise<BulkOperationResult> {
   const tableName = USER_TABLE_ROWS_SQL_NAME
 
   // Build filter clause
-  const filterClause = buildFilterClause(data.filter, tableName)
+  const filterClause = buildFilterClause(data.filter, tableName, table.schema.columns)
   if (!filterClause) {
     throw new Error('Filter is required for bulk delete')
   }
 
   // Find matching rows
   const baseConditions = and(
-    eq(userTableRows.tableId, data.tableId),
-    eq(userTableRows.workspaceId, data.workspaceId)
+    eq(userTableRows.tableId, table.id),
+    eq(userTableRows.workspaceId, table.workspaceId)
   )
 
   let query = db
@@ -2081,8 +2622,8 @@ export async function deleteRowsByFilter(
       const batch = rowIds.slice(i, i + TABLE_LIMITS.DELETE_BATCH_SIZE)
       await trx.delete(userTableRows).where(
         and(
-          eq(userTableRows.tableId, data.tableId),
-          eq(userTableRows.workspaceId, data.workspaceId),
+          eq(userTableRows.tableId, table.id),
+          eq(userTableRows.workspaceId, table.workspaceId),
           sql`${userTableRows.id} = ANY(ARRAY[${sql.join(
             batch.map((id) => sql`${id}`),
             sql`, `
@@ -2091,11 +2632,10 @@ export async function deleteRowsByFilter(
       )
     }
 
-    await recompactPositions(data.tableId, trx, minDeletedPos)
+    await recompactPositions(table.id, trx, minDeletedPos)
   })
 
-  logger.info(`[${requestId}] Deleted ${matchingRows.length} rows from table ${data.tableId}`)
-  for (const id of rowIds) notifyTableRowDeleted(data.tableId, id)
+  logger.info(`[${requestId}] Deleted ${matchingRows.length} rows from table ${table.id}`)
 
   return {
     affectedCount: matchingRows.length,
@@ -2153,7 +2693,6 @@ export async function deleteRowsByIds(
   const missingRowIds = uniqueRequestedRowIds.filter((id) => !deletedIdSet.has(id))
 
   logger.info(`[${requestId}] Deleted ${deletedIds.length} rows by ID from table ${data.tableId}`)
-  for (const id of deletedIds) notifyTableRowDeleted(data.tableId, id)
 
   return {
     deletedCount: deletedIds.length,
@@ -2175,106 +2714,108 @@ export async function renameColumn(
   data: RenameColumnData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
-
-  if (!NAME_PATTERN.test(data.newName)) {
-    throw new Error(
-      `Invalid column name "${data.newName}". Column names must start with a letter or underscore, followed by alphanumeric characters or underscores.`
-    )
-  }
-
-  if (data.newName.length > TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH) {
-    throw new Error(
-      `Column name exceeds maximum length (${TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH} characters)`
-    )
-  }
-
-  const schema = table.schema
-  const columnIndex = schema.columns.findIndex(
-    (c) => c.name.toLowerCase() === data.oldName.toLowerCase()
-  )
-  if (columnIndex === -1) {
-    throw new Error(`Column "${data.oldName}" not found`)
-  }
-
-  if (
-    schema.columns.some(
-      (c, i) => i !== columnIndex && c.name.toLowerCase() === data.newName.toLowerCase()
-    )
-  ) {
-    throw new Error(`Column "${data.newName}" already exists`)
-  }
-
-  const actualOldName = schema.columns[columnIndex].name
-  const updatedColumns = schema.columns.map((c, i) =>
-    i === columnIndex ? { ...c, name: data.newName } : c
-  )
-  // Cascade rename into every workflow group: its output `columnName` refs
-  // and its `dependencies.columns` entries.
-  const updatedGroups = (schema.workflowGroups ?? []).map((group) => {
-    const renamedOutputs = group.outputs.map((o) =>
-      o.columnName === actualOldName ? { ...o, columnName: data.newName } : o
-    )
-    const renamedDeps = group.dependencies?.columns?.map((d) =>
-      d === actualOldName ? data.newName : d
-    )
-    const renamedGroupDeps = group.dependencies?.workflowGroups
-    const next = {
-      ...group,
-      outputs: renamedOutputs,
-      dependencies: {
-        ...(renamedDeps ? { columns: renamedDeps } : {}),
-        ...(renamedGroupDeps ? { workflowGroups: renamedGroupDeps } : {}),
-      },
+  return withLockedTable(data.tableId, async (table, trx) => {
+    if (!NAME_PATTERN.test(data.newName)) {
+      throw new Error(
+        `Invalid column name "${data.newName}". Column names must start with a letter or underscore, followed by alphanumeric characters or underscores.`
+      )
     }
-    return next
-  })
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: updatedColumns,
-    ...(updatedGroups.length > 0 ? { workflowGroups: updatedGroups } : {}),
-  }
-  assertValidSchema(updatedSchema, table.metadata?.columnOrder)
 
-  const metadata = table.metadata as TableMetadata | null
-  let updatedMetadata = metadata
-  if (metadata?.columnWidths && actualOldName in metadata.columnWidths) {
-    const { [actualOldName]: width, ...rest } = metadata.columnWidths
-    updatedMetadata = { ...metadata, columnWidths: { ...rest, [data.newName]: width } }
-  }
-  if (updatedMetadata?.columnOrder?.includes(actualOldName)) {
-    updatedMetadata = {
-      ...updatedMetadata,
-      columnOrder: updatedMetadata.columnOrder.map((n) => (n === actualOldName ? data.newName : n)),
+    if (data.newName.length > TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH) {
+      throw new Error(
+        `Column name exceeds maximum length (${TABLE_LIMITS.MAX_COLUMN_NAME_LENGTH} characters)`
+      )
     }
-  }
 
-  const now = new Date()
-  const statementMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
-    baseMs: 60_000,
-    perRowMs: 2,
-  })
+    const schema = table.schema
+    const columnIndex = schema.columns.findIndex(
+      (c) => c.name.toLowerCase() === data.oldName.toLowerCase()
+    )
+    if (columnIndex === -1) {
+      throw new Error(`Column "${data.oldName}" not found`)
+    }
 
-  await db.transaction(async (trx) => {
+    if (
+      schema.columns.some(
+        (c, i) => i !== columnIndex && c.name.toLowerCase() === data.newName.toLowerCase()
+      )
+    ) {
+      throw new Error(`Column "${data.newName}" already exists`)
+    }
+
+    const actualOldName = schema.columns[columnIndex].name
+    const updatedColumns = schema.columns.map((c, i) =>
+      i === columnIndex ? { ...c, name: data.newName } : c
+    )
+    // Cascade rename into every workflow group: its output `columnName` refs,
+    // its `dependencies.columns` entries, and its `inputMappings` source columns.
+    const updatedGroups = (schema.workflowGroups ?? []).map((group) => {
+      const renamedOutputs = group.outputs.map((o) =>
+        o.columnName === actualOldName ? { ...o, columnName: data.newName } : o
+      )
+      const renamedDeps = group.dependencies?.columns?.map((d) =>
+        d === actualOldName ? data.newName : d
+      )
+      const renamedMappings = group.inputMappings?.map((m) =>
+        m.columnName === actualOldName ? { ...m, columnName: data.newName } : m
+      )
+      return {
+        ...group,
+        outputs: renamedOutputs,
+        ...(renamedDeps ? { dependencies: { columns: renamedDeps } } : {}),
+        ...(renamedMappings ? { inputMappings: renamedMappings } : {}),
+      }
+    })
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: updatedColumns,
+      ...(updatedGroups.length > 0 ? { workflowGroups: updatedGroups } : {}),
+    }
+
+    const metadata = table.metadata as TableMetadata | null
+    let updatedMetadata = metadata
+    if (metadata?.columnWidths && actualOldName in metadata.columnWidths) {
+      const { [actualOldName]: width, ...rest } = metadata.columnWidths
+      updatedMetadata = { ...metadata, columnWidths: { ...rest, [data.newName]: width } }
+    }
+    if (updatedMetadata?.columnOrder?.includes(actualOldName)) {
+      updatedMetadata = {
+        ...updatedMetadata,
+        columnOrder: updatedMetadata.columnOrder.map((n) =>
+          n === actualOldName ? data.newName : n
+        ),
+      }
+    }
+    // Validate against the *post-rename* column order. The schema's workflow
+    // group outputs already reference the new name, so checking against the old
+    // columnOrder makes the renamed output look "missing" from its group and
+    // falsely flags the remaining siblings as non-contiguous.
+    assertValidSchema(updatedSchema, updatedMetadata?.columnOrder)
+
+    const now = new Date()
+    const statementMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
+      baseMs: 60_000,
+      perRowMs: 2,
+    })
     await setTableTxTimeouts(trx, { statementMs })
+
     await trx
       .update(userTableDefinitions)
       .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
       .where(eq(userTableDefinitions.id, data.tableId))
 
+    // All bindings parameterized — `data->` accepts a text parameter for the
+    // key, no need to drop into `sql.raw` with hand-rolled quote escaping.
     await trx.execute(
-      sql`UPDATE user_table_rows SET data = data - ${actualOldName}::text || jsonb_build_object(${data.newName}::text, data->${sql.raw(`'${actualOldName.replace(/'/g, "''")}'`)}) WHERE table_id = ${data.tableId} AND data ? ${actualOldName}::text`
+      sql`UPDATE user_table_rows SET data = data - ${actualOldName}::text || jsonb_build_object(${data.newName}::text, data->${actualOldName}::text) WHERE table_id = ${data.tableId} AND data ? ${actualOldName}::text`
     )
+
+    logger.info(
+      `[${requestId}] Renamed column "${actualOldName}" to "${data.newName}" in table ${data.tableId}`
+    )
+
+    return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
   })
-
-  logger.info(
-    `[${requestId}] Renamed column "${actualOldName}" to "${data.newName}" in table ${data.tableId}`
-  )
-
-  return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
 }
 
 /**
@@ -2289,94 +2830,62 @@ export async function deleteColumn(
   data: DeleteColumnData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
-
-  const schema = table.schema
-  const columnIndex = schema.columns.findIndex(
-    (c) => c.name.toLowerCase() === data.columnName.toLowerCase()
-  )
-  if (columnIndex === -1) {
-    throw new Error(`Column "${data.columnName}" not found`)
-  }
-
-  if (schema.columns.length <= 1) {
-    throw new Error('Cannot delete the last column in a table')
-  }
-
-  const targetColumn = schema.columns[columnIndex]
-  const actualName = targetColumn.name
-  const ownerGroupId = targetColumn.workflowGroupId
-
-  // Drop this column's reference from every group's outputs and `columns`
-  // dependency. If the column is the last output of its parent group, the
-  // group itself is also removed (a group with zero outputs is invalid),
-  // and any OTHER group depending on this group has the dep cleared too.
-  let groupRemovedId: string | null = null
-  let updatedGroups = (schema.workflowGroups ?? []).map((group) => {
-    let next = group
-    if (ownerGroupId && group.id === ownerGroupId) {
-      const remaining = group.outputs.filter((o) => o.columnName !== actualName)
-      if (remaining.length === 0) {
-        groupRemovedId = group.id
-      }
-      next = { ...next, outputs: remaining }
+  return withLockedTable(data.tableId, async (table, trx) => {
+    const schema = table.schema
+    const columnIndex = schema.columns.findIndex(
+      (c) => c.name.toLowerCase() === data.columnName.toLowerCase()
+    )
+    if (columnIndex === -1) {
+      throw new Error(`Column "${data.columnName}" not found`)
     }
-    const filtered = next.dependencies?.columns?.filter((d) => d !== actualName)
-    if (filtered && filtered.length !== (next.dependencies?.columns?.length ?? 0)) {
-      next = {
-        ...next,
-        dependencies: {
-          ...(filtered.length > 0 ? { columns: filtered } : {}),
-          ...(next.dependencies?.workflowGroups
-            ? { workflowGroups: next.dependencies.workflowGroups }
-            : {}),
-        },
-      }
+
+    if (schema.columns.length <= 1) {
+      throw new Error('Cannot delete the last column in a table')
     }
-    return next
-  })
-  if (groupRemovedId) {
-    const removed = groupRemovedId
-    updatedGroups = updatedGroups
-      .filter((g) => g.id !== removed)
-      .map((g) =>
-        g.dependencies?.workflowGroups
-          ? {
-              ...g,
-              dependencies: {
-                ...(g.dependencies.columns ? { columns: g.dependencies.columns } : {}),
-                workflowGroups: g.dependencies.workflowGroups.filter((id) => id !== removed),
-              },
-            }
-          : g
-      )
-  }
 
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: schema.columns.filter((_, i) => i !== columnIndex),
-    ...(updatedGroups.length > 0 ? { workflowGroups: updatedGroups } : {}),
-  }
-  assertValidSchema(updatedSchema, table.metadata?.columnOrder)
+    const targetColumn = schema.columns[columnIndex]
+    const actualName = targetColumn.name
+    const ownerGroupId = targetColumn.workflowGroupId
 
-  const metadata = table.metadata as TableMetadata | null
-  let updatedMetadata = metadata
-  if (metadata?.columnWidths && actualName in metadata.columnWidths) {
-    const { [actualName]: _, ...rest } = metadata.columnWidths
-    updatedMetadata = { ...metadata, columnWidths: rest }
-  }
+    // Drop this column's reference from every group's outputs and `columns`
+    // dependency. If the column is the last output of its parent group, the
+    // group itself is also removed (a group with zero outputs is invalid).
+    let groupRemovedId: string | null = null
+    const updatedGroups = (schema.workflowGroups ?? [])
+      .map((group) => {
+        let next = group
+        if (ownerGroupId && group.id === ownerGroupId) {
+          const remaining = group.outputs.filter((o) => o.columnName !== actualName)
+          if (remaining.length === 0) {
+            groupRemovedId = group.id
+          }
+          next = { ...next, outputs: remaining }
+        }
+        return stripGroupDeps(next, new Set([actualName]))
+      })
+      .filter((g) => g.id !== groupRemovedId)
 
-  const now = new Date()
-  const statementMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
-    baseMs: 60_000,
-    perRowMs: 2,
-  })
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: schema.columns.filter((_, i) => i !== columnIndex),
+      ...(updatedGroups.length > 0 ? { workflowGroups: updatedGroups } : {}),
+    }
+    assertValidSchema(updatedSchema, table.metadata?.columnOrder)
 
-  await db.transaction(async (trx) => {
+    const metadata = table.metadata as TableMetadata | null
+    let updatedMetadata = metadata
+    if (metadata?.columnWidths && actualName in metadata.columnWidths) {
+      const { [actualName]: _, ...rest } = metadata.columnWidths
+      updatedMetadata = { ...metadata, columnWidths: rest }
+    }
+
+    const now = new Date()
+    const statementMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
+      baseMs: 60_000,
+      perRowMs: 2,
+    })
     await setTableTxTimeouts(trx, { statementMs })
+
     await trx
       .update(userTableDefinitions)
       .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
@@ -2385,11 +2894,12 @@ export async function deleteColumn(
     await trx.execute(
       sql`UPDATE user_table_rows SET data = data - ${actualName}::text WHERE table_id = ${data.tableId} AND data ? ${actualName}::text`
     )
+    if (groupRemovedId) await stripGroupExecutions(trx, data.tableId, [groupRemovedId])
+
+    logger.info(`[${requestId}] Deleted column "${actualName}" from table ${data.tableId}`)
+
+    return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
   })
-
-  logger.info(`[${requestId}] Deleted column "${actualName}" from table ${data.tableId}`)
-
-  return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
 }
 
 /**
@@ -2400,87 +2910,68 @@ export async function deleteColumns(
   data: { tableId: string; columnNames: string[] },
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  return withLockedTable(data.tableId, async (table, trx) => {
+    const schema = table.schema
+    const namesToDelete = new Set<string>()
+    const notFound: string[] = []
 
-  const schema = table.schema
-  const namesToDelete = new Set<string>()
-  const notFound: string[] = []
-
-  for (const name of data.columnNames) {
-    const col = schema.columns.find((c) => c.name.toLowerCase() === name.toLowerCase())
-    if (!col) {
-      notFound.push(name)
-    } else {
-      namesToDelete.add(col.name)
-    }
-  }
-
-  if (notFound.length > 0) {
-    throw new Error(`Columns not found: ${notFound.join(', ')}`)
-  }
-
-  const remaining = schema.columns.filter((c) => !namesToDelete.has(c.name))
-  if (remaining.length === 0) {
-    throw new Error('Cannot delete all columns from a table')
-  }
-
-  // For each group, drop outputs whose column is being deleted. Groups that
-  // end up with zero outputs are removed entirely (they'd be invalid). Then
-  // any remaining group's dependencies referencing a removed group or
-  // deleted column are cleaned up.
-  const removedGroupIds = new Set<string>()
-  let updatedGroups = (schema.workflowGroups ?? []).map((group) => {
-    const remainingOutputs = group.outputs.filter((o) => !namesToDelete.has(o.columnName))
-    if (remainingOutputs.length === 0) {
-      removedGroupIds.add(group.id)
-    }
-    return remainingOutputs.length === group.outputs.length
-      ? group
-      : { ...group, outputs: remainingOutputs }
-  })
-  updatedGroups = updatedGroups
-    .filter((g) => !removedGroupIds.has(g.id))
-    .map((group) => {
-      const depCols = group.dependencies?.columns?.filter((d) => !namesToDelete.has(d))
-      const depGroups = group.dependencies?.workflowGroups?.filter((id) => !removedGroupIds.has(id))
-      const colsChanged = depCols && depCols.length !== (group.dependencies?.columns?.length ?? 0)
-      const groupsChanged =
-        depGroups && depGroups.length !== (group.dependencies?.workflowGroups?.length ?? 0)
-      if (!colsChanged && !groupsChanged) return group
-      return {
-        ...group,
-        dependencies: {
-          ...(depCols && depCols.length > 0 ? { columns: depCols } : {}),
-          ...(depGroups && depGroups.length > 0 ? { workflowGroups: depGroups } : {}),
-        },
+    for (const name of data.columnNames) {
+      const col = schema.columns.find((c) => c.name.toLowerCase() === name.toLowerCase())
+      if (!col) {
+        notFound.push(name)
+      } else {
+        namesToDelete.add(col.name)
       }
+    }
+
+    if (notFound.length > 0) {
+      throw new Error(`Columns not found: ${notFound.join(', ')}`)
+    }
+
+    const remaining = schema.columns.filter((c) => !namesToDelete.has(c.name))
+    if (remaining.length === 0) {
+      throw new Error('Cannot delete all columns from a table')
+    }
+
+    // For each group, drop outputs whose column is being deleted. Groups that
+    // end up with zero outputs are removed entirely (they'd be invalid). Then
+    // any remaining group's dependencies referencing a removed group or
+    // deleted column are cleaned up.
+    const removedGroupIds = new Set<string>()
+    let updatedGroups = (schema.workflowGroups ?? []).map((group) => {
+      const remainingOutputs = group.outputs.filter((o) => !namesToDelete.has(o.columnName))
+      if (remainingOutputs.length === 0) {
+        removedGroupIds.add(group.id)
+      }
+      return remainingOutputs.length === group.outputs.length
+        ? group
+        : { ...group, outputs: remainingOutputs }
     })
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: remaining,
-    ...(updatedGroups.length > 0 ? { workflowGroups: updatedGroups } : {}),
-  }
-  assertValidSchema(updatedSchema, table.metadata?.columnOrder)
+    updatedGroups = updatedGroups
+      .filter((g) => !removedGroupIds.has(g.id))
+      .map((group) => stripGroupDeps(group, namesToDelete))
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: remaining,
+      ...(updatedGroups.length > 0 ? { workflowGroups: updatedGroups } : {}),
+    }
+    assertValidSchema(updatedSchema, table.metadata?.columnOrder)
 
-  const metadata = table.metadata as TableMetadata | null
-  let updatedMetadata = metadata
-  if (metadata?.columnWidths) {
-    const widths = { ...metadata.columnWidths }
-    for (const n of namesToDelete) delete widths[n]
-    updatedMetadata = { ...metadata, columnWidths: widths }
-  }
+    const metadata = table.metadata as TableMetadata | null
+    let updatedMetadata = metadata
+    if (metadata?.columnWidths) {
+      const widths = { ...metadata.columnWidths }
+      for (const n of namesToDelete) delete widths[n]
+      updatedMetadata = { ...metadata, columnWidths: widths }
+    }
 
-  const now = new Date()
-  const statementMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
-    baseMs: 60_000,
-    perRowMs: 2 * namesToDelete.size,
-  })
-
-  await db.transaction(async (trx) => {
+    const now = new Date()
+    const statementMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
+      baseMs: 60_000,
+      perRowMs: 2 * namesToDelete.size,
+    })
     await setTableTxTimeouts(trx, { statementMs })
+
     await trx
       .update(userTableDefinitions)
       .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
@@ -2491,13 +2982,14 @@ export async function deleteColumns(
         sql`UPDATE user_table_rows SET data = data - ${name}::text WHERE table_id = ${data.tableId} AND data ? ${name}::text`
       )
     }
+    await stripGroupExecutions(trx, data.tableId, removedGroupIds)
+
+    logger.info(
+      `[${requestId}] Deleted columns [${[...namesToDelete].join(', ')}] from table ${data.tableId}`
+    )
+
+    return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
   })
-
-  logger.info(
-    `[${requestId}] Deleted columns [${[...namesToDelete].join(', ')}] from table ${data.tableId}`
-  )
-
-  return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
 }
 
 /**
@@ -2512,77 +3004,83 @@ export async function updateColumnType(
   data: UpdateColumnTypeData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  return withLockedTable(data.tableId, async (table, trx) => {
+    // Scale both statement and idle timeouts to row count: the compatibility
+    // check below iterates every row in Node between the row SELECT and the
+    // schema UPDATE, leaving the transaction idle for that gap. The default 5s
+    // `idle_in_transaction_session_timeout` would abort a valid type change on
+    // a large table.
+    const timeoutMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
+      baseMs: 60_000,
+      perRowMs: 2,
+    })
+    await setTableTxTimeouts(trx, { statementMs: timeoutMs, idleMs: timeoutMs })
 
-  if (!(COLUMN_TYPES as readonly string[]).includes(data.newType)) {
-    throw new Error(
-      `Invalid column type "${data.newType}". Valid types: ${COLUMN_TYPES.join(', ')}`
-    )
-  }
-
-  const schema = table.schema
-  const columnIndex = schema.columns.findIndex(
-    (c) => c.name.toLowerCase() === data.columnName.toLowerCase()
-  )
-  if (columnIndex === -1) {
-    throw new Error(`Column "${data.columnName}" not found`)
-  }
-
-  const column = schema.columns[columnIndex]
-  if (column.type === data.newType) {
-    return table
-  }
-
-  const escapedName = column.name.replace(/'/g, "''")
-
-  // Validate existing data is compatible with the new type
-  const rows = await db
-    .select({ id: userTableRows.id, data: userTableRows.data })
-    .from(userTableRows)
-    .where(
-      and(
-        eq(userTableRows.tableId, data.tableId),
-        sql`${userTableRows.data} ? ${column.name}`,
-        sql`${userTableRows.data}->>${sql.raw(`'${escapedName}'`)} IS NOT NULL`
+    if (!(COLUMN_TYPES as readonly string[]).includes(data.newType)) {
+      throw new Error(
+        `Invalid column type "${data.newType}". Valid types: ${COLUMN_TYPES.join(', ')}`
       )
-    )
-
-  let incompatibleCount = 0
-  for (const row of rows) {
-    const rowData = row.data as RowData
-    const value = rowData[column.name]
-    if (value === null || value === undefined) continue
-
-    if (!isValueCompatibleWithType(value, data.newType)) {
-      incompatibleCount++
     }
-  }
 
-  if (incompatibleCount > 0) {
-    throw new Error(
-      `Cannot change column "${column.name}" to type "${data.newType}": ${incompatibleCount} row(s) have incompatible values. Fix or remove the incompatible values first.`
+    const schema = table.schema
+    const columnIndex = schema.columns.findIndex(
+      (c) => c.name.toLowerCase() === data.columnName.toLowerCase()
     )
-  }
+    if (columnIndex === -1) {
+      throw new Error(`Column "${data.columnName}" not found`)
+    }
 
-  const updatedColumns = schema.columns.map((c, i) =>
-    i === columnIndex ? { ...c, type: data.newType } : c
-  )
-  const updatedSchema: TableSchema = { ...schema, columns: updatedColumns }
-  const now = new Date()
+    const column = schema.columns[columnIndex]
+    if (column.type === data.newType) {
+      return table
+    }
 
-  await db
-    .update(userTableDefinitions)
-    .set({ schema: updatedSchema, updatedAt: now })
-    .where(eq(userTableDefinitions.id, data.tableId))
+    // Validate existing data is compatible with the new type
+    const rows = await trx
+      .select({ id: userTableRows.id, data: userTableRows.data })
+      .from(userTableRows)
+      .where(
+        and(
+          eq(userTableRows.tableId, data.tableId),
+          sql`${userTableRows.data} ? ${column.name}`,
+          sql`${userTableRows.data}->>${column.name}::text IS NOT NULL`
+        )
+      )
 
-  logger.info(
-    `[${requestId}] Changed column "${column.name}" type from "${column.type}" to "${data.newType}" in table ${data.tableId}`
-  )
+    let incompatibleCount = 0
+    for (const row of rows) {
+      const rowData = row.data as RowData
+      const value = rowData[column.name]
+      if (value === null || value === undefined) continue
 
-  return { ...table, schema: updatedSchema, updatedAt: now }
+      if (!isValueCompatibleWithType(value, data.newType)) {
+        incompatibleCount++
+      }
+    }
+
+    if (incompatibleCount > 0) {
+      throw new Error(
+        `Cannot change column "${column.name}" to type "${data.newType}": ${incompatibleCount} row(s) have incompatible values. Fix or remove the incompatible values first.`
+      )
+    }
+
+    const updatedColumns = schema.columns.map((c, i) =>
+      i === columnIndex ? { ...c, type: data.newType } : c
+    )
+    const updatedSchema: TableSchema = { ...schema, columns: updatedColumns }
+    const now = new Date()
+
+    await trx
+      .update(userTableDefinitions)
+      .set({ schema: updatedSchema, updatedAt: now })
+      .where(eq(userTableDefinitions.id, data.tableId))
+
+    logger.info(
+      `[${requestId}] Changed column "${column.name}" type from "${column.type}" to "${data.newType}" in table ${data.tableId}`
+    )
+
+    return { ...table, schema: updatedSchema, updatedAt: now }
+  })
 }
 
 /**
@@ -2597,77 +3095,83 @@ export async function updateColumnConstraints(
   data: UpdateColumnConstraintsData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  return withLockedTable(data.tableId, async (table, trx) => {
+    // Scale both statement and idle timeouts to row count: the required/unique
+    // validation runs between separate queries inside this transaction, leaving
+    // it briefly idle. Match `updateColumnType` so the default 5s
+    // `idle_in_transaction_session_timeout` can't abort a valid change on a
+    // large table.
+    const timeoutMs = scaledStatementTimeoutMs(table.rowCount ?? 0, {
+      baseMs: 60_000,
+      perRowMs: 2,
+    })
+    await setTableTxTimeouts(trx, { statementMs: timeoutMs, idleMs: timeoutMs })
 
-  const schema = table.schema
-  const columnIndex = schema.columns.findIndex(
-    (c) => c.name.toLowerCase() === data.columnName.toLowerCase()
-  )
-  if (columnIndex === -1) {
-    throw new Error(`Column "${data.columnName}" not found`)
-  }
-
-  const column = schema.columns[columnIndex]
-  if (column.workflowGroupId) {
-    throw new Error(
-      `Cannot change constraints on workflow-output column "${column.name}". Constraints aren't applicable to columns whose values come from workflow execution.`
+    const schema = table.schema
+    const columnIndex = schema.columns.findIndex(
+      (c) => c.name.toLowerCase() === data.columnName.toLowerCase()
     )
-  }
-  const escapedName = column.name.replace(/'/g, "''")
+    if (columnIndex === -1) {
+      throw new Error(`Column "${data.columnName}" not found`)
+    }
 
-  if (data.required === true && !column.required) {
-    const [result] = await db
-      .select({ count: count() })
-      .from(userTableRows)
-      .where(
-        and(
-          eq(userTableRows.tableId, data.tableId),
-          sql`(NOT (${userTableRows.data} ? ${column.name}) OR ${userTableRows.data}->>${sql.raw(`'${escapedName}'`)} IS NULL)`
-        )
-      )
-
-    if (result.count > 0) {
+    const column = schema.columns[columnIndex]
+    if (column.workflowGroupId) {
       throw new Error(
-        `Cannot set column "${column.name}" as required: ${result.count} row(s) have null or missing values`
+        `Cannot change constraints on workflow-output column "${column.name}". Constraints aren't applicable to columns whose values come from workflow execution.`
       )
     }
-  }
+    if (data.required === true && !column.required) {
+      const [result] = await trx
+        .select({ count: count() })
+        .from(userTableRows)
+        .where(
+          and(
+            eq(userTableRows.tableId, data.tableId),
+            sql`(NOT (${userTableRows.data} ? ${column.name}) OR ${userTableRows.data}->>${column.name}::text IS NULL)`
+          )
+        )
 
-  if (data.unique === true && !column.unique) {
-    const duplicates = (await db.execute(
-      sql`SELECT ${userTableRows.data}->>${sql.raw(`'${escapedName}'`)} AS val, count(*) AS cnt FROM ${userTableRows} WHERE table_id = ${data.tableId} AND ${userTableRows.data} ? ${column.name} AND ${userTableRows.data}->>${sql.raw(`'${escapedName}'`)} IS NOT NULL GROUP BY val HAVING count(*) > 1 LIMIT 1`
-    )) as { val: string; cnt: number }[]
-
-    if (duplicates.length > 0) {
-      throw new Error(`Cannot set column "${column.name}" as unique: duplicate values exist`)
+      if (result.count > 0) {
+        throw new Error(
+          `Cannot set column "${column.name}" as required: ${result.count} row(s) have null or missing values`
+        )
+      }
     }
-  }
 
-  const updatedColumns = schema.columns.map((c, i) =>
-    i === columnIndex
-      ? {
-          ...c,
-          ...(data.required !== undefined ? { required: data.required } : {}),
-          ...(data.unique !== undefined ? { unique: data.unique } : {}),
-        }
-      : c
-  )
-  const updatedSchema: TableSchema = { ...schema, columns: updatedColumns }
-  const now = new Date()
+    if (data.unique === true && !column.unique) {
+      const duplicates = (await trx.execute(
+        sql`SELECT ${userTableRows.data}->>${column.name}::text AS val, count(*) AS cnt FROM ${userTableRows} WHERE table_id = ${data.tableId} AND ${userTableRows.data} ? ${column.name} AND ${userTableRows.data}->>${column.name}::text IS NOT NULL GROUP BY val HAVING count(*) > 1 LIMIT 1`
+      )) as { val: string; cnt: number }[]
 
-  await db
-    .update(userTableDefinitions)
-    .set({ schema: updatedSchema, updatedAt: now })
-    .where(eq(userTableDefinitions.id, data.tableId))
+      if (duplicates.length > 0) {
+        throw new Error(`Cannot set column "${column.name}" as unique: duplicate values exist`)
+      }
+    }
 
-  logger.info(
-    `[${requestId}] Updated constraints for column "${column.name}" in table ${data.tableId}`
-  )
+    const updatedColumns = schema.columns.map((c, i) =>
+      i === columnIndex
+        ? {
+            ...c,
+            ...(data.required !== undefined ? { required: data.required } : {}),
+            ...(data.unique !== undefined ? { unique: data.unique } : {}),
+          }
+        : c
+    )
+    const updatedSchema: TableSchema = { ...schema, columns: updatedColumns }
+    const now = new Date()
 
-  return { ...table, schema: updatedSchema, updatedAt: now }
+    await trx
+      .update(userTableDefinitions)
+      .set({ schema: updatedSchema, updatedAt: now })
+      .where(eq(userTableDefinitions.id, data.tableId))
+
+    logger.info(
+      `[${requestId}] Updated constraints for column "${column.name}" in table ${data.tableId}`
+    )
+
+    return { ...table, schema: updatedSchema, updatedAt: now }
+  })
 }
 
 /**
@@ -2679,78 +3183,84 @@ export async function addWorkflowGroup(
   data: AddWorkflowGroupData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  const updatedTable = await withLockedTable(data.tableId, async (table, trx) => {
+    const schema = table.schema
+    const groups = schema.workflowGroups ?? []
+    if (groups.some((g) => g.id === data.group.id)) {
+      throw new Error(`Workflow group "${data.group.id}" already exists`)
+    }
 
-  const schema = table.schema
-  const groups = schema.workflowGroups ?? []
-  if (groups.some((g) => g.id === data.group.id)) {
-    throw new Error(`Workflow group "${data.group.id}" already exists`)
-  }
+    const existingNames = new Set(schema.columns.map((c) => c.name.toLowerCase()))
+    for (const col of data.outputColumns) {
+      if (!NAME_PATTERN.test(col.name)) {
+        throw new Error(
+          `Invalid output column name "${col.name}". Must satisfy ${NAME_PATTERN.source}.`
+        )
+      }
+      if (existingNames.has(col.name.toLowerCase())) {
+        throw new Error(`Column "${col.name}" already exists`)
+      }
+    }
 
-  const existingNames = new Set(schema.columns.map((c) => c.name.toLowerCase()))
-  for (const col of data.outputColumns) {
-    if (!NAME_PATTERN.test(col.name)) {
+    if (schema.columns.length + data.outputColumns.length > TABLE_LIMITS.MAX_COLUMNS_PER_TABLE) {
       throw new Error(
-        `Invalid output column name "${col.name}". Must satisfy ${NAME_PATTERN.source}.`
+        `Adding ${data.outputColumns.length} columns would exceed the maximum (${TABLE_LIMITS.MAX_COLUMNS_PER_TABLE}).`
       )
     }
-    if (existingNames.has(col.name.toLowerCase())) {
-      throw new Error(`Column "${col.name}" already exists`)
+
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: [...schema.columns, ...data.outputColumns],
+      workflowGroups: [...groups, data.group],
     }
-  }
 
-  if (schema.columns.length + data.outputColumns.length > TABLE_LIMITS.MAX_COLUMNS_PER_TABLE) {
-    throw new Error(
-      `Adding ${data.outputColumns.length} columns would exceed the maximum (${TABLE_LIMITS.MAX_COLUMNS_PER_TABLE}).`
-    )
-  }
-
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: [...schema.columns, ...data.outputColumns],
-    workflowGroups: [...groups, data.group],
-  }
-  assertValidSchema(updatedSchema, table.metadata?.columnOrder)
-
-  const now = new Date()
-  await db
-    .update(userTableDefinitions)
-    .set({ schema: updatedSchema, updatedAt: now })
-    .where(eq(userTableDefinitions.id, data.tableId))
-
-  logger.info(
-    `[${requestId}] Added workflow group "${data.group.id}" with ${data.outputColumns.length} output column(s) to table ${data.tableId}`
-  )
-
-  const updatedTable: TableDefinition = { ...table, schema: updatedSchema, updatedAt: now }
-
-  // Schedule existing rows so already-filled deps trigger immediately. Skipped
-  // when the caller opted out (Mothership stages groups silently — `autoRun:
-  // false` — so the AI can compose multiple changes without firing rows mid-edit).
-  if (data.autoRun !== false) {
-    void (async () => {
-      try {
-        const rowRecords = await db
-          .select()
-          .from(userTableRows)
-          .where(eq(userTableRows.tableId, data.tableId))
-        if (rowRecords.length === 0) return
-        const rows: TableRow[] = rowRecords.map((r) => ({
-          id: r.id,
-          data: r.data as RowData,
-          executions: (r.executions as RowExecutions) ?? {},
-          position: r.position,
-          createdAt: r.createdAt,
-          updatedAt: r.updatedAt,
-        }))
-        await scheduleWorkflowGroupRuns(updatedTable, rows)
-      } catch (err) {
-        logger.error(`[${requestId}] Failed to schedule runs after group add:`, err)
+    // Keep `metadata.columnOrder` in sync — see `addTableColumn` for the
+    // invariant. New output columns get appended in the order the caller
+    // supplied (matches their position in `schema.columns`).
+    const existingOrder = table.metadata?.columnOrder
+    let updatedMetadata = table.metadata
+    if (existingOrder && existingOrder.length > 0) {
+      const known = new Set(existingOrder)
+      const append = data.outputColumns.map((c) => c.name).filter((n) => !known.has(n))
+      if (append.length > 0) {
+        updatedMetadata = { ...table.metadata, columnOrder: [...existingOrder, ...append] }
       }
-    })()
+    }
+
+    assertValidSchema(updatedSchema, updatedMetadata?.columnOrder)
+
+    const now = new Date()
+    await trx
+      .update(userTableDefinitions)
+      .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
+      .where(eq(userTableDefinitions.id, data.tableId))
+
+    logger.info(
+      `[${requestId}] Added workflow group "${data.group.id}" with ${data.outputColumns.length} output column(s) to table ${data.tableId}`
+    )
+
+    return {
+      ...table,
+      schema: updatedSchema,
+      metadata: updatedMetadata,
+      updatedAt: now,
+    }
+  })
+
+  // Auto-fire existing rows whose deps are already met for the new group.
+  // Fire-and-forget — the dispatcher bounds queue depth (window of 20) and
+  // walks the table in the background. HTTP returns instantly; cells fill
+  // in over the next minutes as the dispatcher walks. Mothership opts out
+  // by setting `autoRun: false`.
+  if (data.autoRun !== false) {
+    void runWorkflowColumn({
+      tableId: updatedTable.id,
+      workspaceId: updatedTable.workspaceId,
+      mode: 'new',
+      isManualRun: false,
+      groupIds: [data.group.id],
+      requestId,
+    }).catch((err) => logger.error(`[${requestId}] auto-dispatch (addWorkflowGroup) failed:`, err))
   }
 
   return updatedTable
@@ -2766,147 +3276,297 @@ export async function updateWorkflowGroup(
   data: UpdateWorkflowGroupData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  const mappingUpdates = data.mappingUpdates ?? []
 
-  const schema = table.schema
-  const groups = schema.workflowGroups ?? []
-  const groupIndex = groups.findIndex((g) => g.id === data.groupId)
-  if (groupIndex === -1) {
-    throw new Error(`Workflow group "${data.groupId}" not found`)
-  }
-  const group = groups[groupIndex]
-
-  const newOutputs = data.outputs ?? group.outputs
-  const oldKey = (o: WorkflowGroupOutput) => `${o.blockId}::${o.path}`
-  const oldByKey = new Map(group.outputs.map((o) => [oldKey(o), o]))
-  const newByKey = new Map(newOutputs.map((o) => [oldKey(o), o]))
-
-  const removed = group.outputs.filter((o) => !newByKey.has(oldKey(o)))
-  const added = newOutputs.filter((o) => !oldByKey.has(oldKey(o)))
-  const newColDefs = data.newOutputColumns ?? []
-  const newColByName = new Map(newColDefs.map((c) => [c.name, c]))
-
-  for (const out of added) {
-    if (!newColByName.has(out.columnName)) {
-      throw new Error(
-        `Missing column definition for new output "${out.columnName}" (group ${data.groupId}).`
-      )
-    }
-  }
-
-  const removedColumnNames = new Set(removed.map((o) => o.columnName))
-  let nextColumns = schema.columns.filter((c) => !removedColumnNames.has(c.name))
-  if (newColDefs.length > 0) {
-    // Splice the new column defs into the group's contiguous run rather than
-    // appending at the end. The desired in-group order is `newOutputs` (the
-    // sidebar's BFS-of-the-workflow ordering); we walk it, anchor at the first
-    // surviving sibling's index in `nextColumns`, and emit each output's
-    // column def in turn.
-    const groupColNames = new Set(newOutputs.map((o) => o.columnName))
-    const firstGroupIdx = nextColumns.findIndex((c) => groupColNames.has(c.name))
-    const anchorIdx = firstGroupIdx === -1 ? nextColumns.length : firstGroupIdx
-    const newColByLowerName = new Map(newColDefs.map((c) => [c.name.toLowerCase(), c]))
-    const orderedGroupCols: ColumnDefinition[] = []
-    for (const out of newOutputs) {
-      const fresh = newColByLowerName.get(out.columnName.toLowerCase())
-      if (fresh) {
-        orderedGroupCols.push(fresh)
-      } else {
-        const existing = nextColumns.find(
-          (c) => c.name.toLowerCase() === out.columnName.toLowerCase()
-        )
-        if (existing) orderedGroupCols.push(existing)
+  // Phase 1 (no lock): when there are mapping updates, load the workflow once to
+  // resolve each remap's new leaf type. Kept OFF the advisory-lock critical
+  // section so concurrent group edits on the same table don't time out waiting
+  // on this DB load. Best-effort — a resolution failure leaves column types
+  // unchanged (workflow deleted, block removed). The result is applied against
+  // the fresh schema under the lock in phase 2.
+  const remapLeafTypeByColumn = new Map<string, ColumnDefinition['type']>()
+  // The workflow id the leaf types above were resolved against. Phase 2 only
+  // applies the resolved types if the group still points at this workflow under
+  // the lock — a concurrent `workflowId` change would make them stale.
+  let resolvedForWorkflowId: string | undefined
+  if (mappingUpdates.length > 0) {
+    try {
+      const preTable = await getTableById(data.tableId)
+      const preGroup = preTable?.schema.workflowGroups?.find((g) => g.id === data.groupId)
+      const targetWorkflowId = data.workflowId ?? preGroup?.workflowId
+      if (targetWorkflowId) {
+        resolvedForWorkflowId = targetWorkflowId
+        const [
+          { loadWorkflowFromNormalizedTables },
+          { flattenWorkflowOutputs },
+          { columnTypeForLeaf },
+        ] = await Promise.all([
+          import('@/lib/workflows/persistence/utils'),
+          import('@/lib/workflows/blocks/flatten-outputs'),
+          import('./column-naming'),
+        ])
+        const normalized = await loadWorkflowFromNormalizedTables(targetWorkflowId)
+        if (normalized) {
+          const blocks = Object.values(normalized.blocks ?? {}).map((b) => ({
+            id: b.id,
+            type: b.type,
+            name: b.name,
+            triggerMode: (b as { triggerMode?: boolean }).triggerMode,
+            subBlocks: b.subBlocks as Record<string, unknown> | undefined,
+          }))
+          const flattened = flattenWorkflowOutputs(blocks, normalized.edges ?? [])
+          const flatByKey = new Map(flattened.map((f) => [`${f.blockId}::${f.path}`, f]))
+          for (const u of mappingUpdates) {
+            const match = flatByKey.get(`${u.blockId}::${u.path}`)
+            if (!match) continue
+            const newType = columnTypeForLeaf(match.leafType)
+            if (newType) remapLeafTypeByColumn.set(u.columnName, newType)
+          }
+        }
       }
-    }
-    const remaining = nextColumns.filter((c) => !groupColNames.has(c.name))
-    nextColumns = [
-      ...remaining.slice(0, anchorIdx),
-      ...orderedGroupCols,
-      ...remaining.slice(anchorIdx),
-    ]
-  }
-
-  const updatedGroup: WorkflowGroup = {
-    ...group,
-    workflowId: data.workflowId ?? group.workflowId,
-    name: data.name ?? group.name,
-    dependencies: data.dependencies ?? group.dependencies,
-    outputs: newOutputs,
-  }
-  const nextGroups = groups.map((g, i) => (i === groupIndex ? updatedGroup : g))
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: nextColumns,
-    workflowGroups: nextGroups,
-  }
-
-  // `columnOrder` mirrors the schema layout. Drop removed columns, then splice
-  // the new ones in at the same anchor as `nextColumns` so the table renders
-  // them inside the group's contiguous run instead of at the tail.
-  let updatedColumnOrder = table.metadata?.columnOrder?.filter((n) => !removedColumnNames.has(n))
-  if (updatedColumnOrder && newColDefs.length > 0) {
-    const newColNamesLower = new Set(newColDefs.map((c) => c.name.toLowerCase()))
-    const orderWithoutNew = updatedColumnOrder.filter((n) => !newColNamesLower.has(n.toLowerCase()))
-    const groupColNames = new Set(newOutputs.map((o) => o.columnName))
-    const orderedGroupNames = newOutputs.map((o) => o.columnName)
-    const firstGroupOrderIdx = orderWithoutNew.findIndex((n) => groupColNames.has(n))
-    const anchorOrderIdx = firstGroupOrderIdx === -1 ? orderWithoutNew.length : firstGroupOrderIdx
-    const remainingOrder = orderWithoutNew.filter((n) => !groupColNames.has(n))
-    updatedColumnOrder = [
-      ...remainingOrder.slice(0, anchorOrderIdx),
-      ...orderedGroupNames,
-      ...remainingOrder.slice(anchorOrderIdx),
-    ]
-  }
-  assertValidSchema(updatedSchema, updatedColumnOrder)
-
-  const updatedMetadata: TableMetadata | null =
-    updatedColumnOrder && table.metadata
-      ? { ...table.metadata, columnOrder: updatedColumnOrder }
-      : table.metadata
-        ? { ...table.metadata }
-        : null
-
-  const now = new Date()
-  await db.transaction(async (trx) => {
-    await setTableTxTimeouts(trx, { statementMs: 60_000 })
-    await trx
-      .update(userTableDefinitions)
-      .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
-      .where(eq(userTableDefinitions.id, data.tableId))
-    for (const name of removedColumnNames) {
-      await trx.execute(
-        sql`UPDATE user_table_rows SET data = data - ${name}::text WHERE table_id = ${data.tableId} AND data ? ${name}::text`
+    } catch (err) {
+      logger.warn(
+        `[${requestId}] Could not resolve new leaf types for remap on group ${data.groupId}; leaving column types unchanged:`,
+        err
       )
     }
-  })
-
-  logger.info(
-    `[${requestId}] Updated workflow group "${data.groupId}" in table ${data.tableId} (added=${added.length}, removed=${removed.length})`
-  )
-
-  const updatedTable: TableDefinition = {
-    ...table,
-    schema: updatedSchema,
-    metadata: updatedMetadata,
-    updatedAt: now,
   }
 
-  // Backfill the new outputs from execution logs so already-completed group
-  // runs surface the just-added columns without re-running the workflow.
-  // Awaited so the response only returns once row data is consistent — the
-  // client then refetches and sees the backfilled values immediately. A failed
-  // backfill is logged but doesn't fail the whole request, since the schema
+  const { updatedTable, added, remappedColumnNames, newOutputs, previousAutoRun } =
+    await withLockedTable(data.tableId, async (table, trx) => {
+      await setTableTxTimeouts(trx, { statementMs: 60_000 })
+
+      const schema = table.schema
+      const groups = schema.workflowGroups ?? []
+      const groupIndex = groups.findIndex((g) => g.id === data.groupId)
+      if (groupIndex === -1) {
+        throw new Error(`Workflow group "${data.groupId}" not found`)
+      }
+      const group = groups[groupIndex]
+
+      // Apply `mappingUpdates` first: each entry repoints an existing output's
+      // `(blockId, path)` while preserving the column. We patch the **old** view
+      // of outputs so the downstream `(blockId, path)`-keyed diff doesn't see the
+      // swap as a remove+add. The corresponding row data is cleared after the
+      // schema write so stale values from the old source don't linger.
+      const remappedColumnNames = new Set<string>()
+      // Per-column type override resolved (out-of-lock) from the new mapping's
+      // leaf type. Only populated when a remap actually changes the column's
+      // type against the fresh schema — keeps the schema patch a no-op when the
+      // user repoints to an output of the same type.
+      const remappedColumnTypes = new Map<string, ColumnDefinition['type']>()
+      let oldOutputs = group.outputs
+      if (mappingUpdates.length > 0) {
+        const updateByName = new Map(mappingUpdates.map((u) => [u.columnName, u]))
+        for (const u of mappingUpdates) {
+          const exists = oldOutputs.some((o) => o.columnName === u.columnName)
+          if (!exists) {
+            throw new Error(
+              `Mapping update for unknown column "${u.columnName}" (group ${data.groupId}).`
+            )
+          }
+        }
+        oldOutputs = oldOutputs.map((o) => {
+          const u = updateByName.get(o.columnName)
+          if (!u) return o
+          remappedColumnNames.add(o.columnName)
+          return { ...o, blockId: u.blockId, path: u.path }
+        })
+
+        // Only apply the out-of-lock leaf-type resolution if the group still
+        // points at the workflow we resolved against. If a concurrent writer
+        // changed `workflowId` between phase 1 and now, those types are stale —
+        // leave column types unchanged (best-effort, same as a resolution
+        // failure) rather than stamping types from the old workflow.
+        const finalWorkflowId = data.workflowId ?? group.workflowId
+        if (remapLeafTypeByColumn.size > 0 && resolvedForWorkflowId !== finalWorkflowId) {
+          logger.warn(
+            `[${requestId}] Workflow group "${data.groupId}" workflowId changed between leaf-type resolution and apply; leaving remapped column types unchanged.`
+          )
+        } else {
+          const colByName = new Map(schema.columns.map((c) => [c.name, c]))
+          for (const u of mappingUpdates) {
+            const newType = remapLeafTypeByColumn.get(u.columnName)
+            if (!newType) continue
+            const oldType = colByName.get(u.columnName)?.type
+            if (newType !== oldType) {
+              remappedColumnTypes.set(u.columnName, newType)
+            }
+          }
+        }
+      }
+
+      // If the caller passed `outputs`, that's the new full set. If only
+      // `mappingUpdates` was sent, the new set is the remapped old set.
+      const newOutputs = data.outputs ?? oldOutputs
+      // Enrichment outputs all share empty `blockId`/`path`, so keying on those
+      // alone collapses every sibling to one entry (dropping columns on diff). Key
+      // on the registry `outputId` when present; fall back to `blockId::path` for
+      // workflow outputs.
+      const oldKey = (o: WorkflowGroupOutput) =>
+        o.outputId ? `out::${o.outputId}` : `${o.blockId}::${o.path}`
+      const oldByKey = new Map(oldOutputs.map((o) => [oldKey(o), o]))
+      const newByKey = new Map(newOutputs.map((o) => [oldKey(o), o]))
+
+      const removed = oldOutputs.filter((o) => !newByKey.has(oldKey(o)))
+      const added = newOutputs.filter((o) => !oldByKey.has(oldKey(o)))
+      const newColDefs = data.newOutputColumns ?? []
+      const newColByName = new Map(newColDefs.map((c) => [c.name, c]))
+
+      for (const out of added) {
+        if (!newColByName.has(out.columnName)) {
+          throw new Error(
+            `Missing column definition for new output "${out.columnName}" (group ${data.groupId}).`
+          )
+        }
+      }
+
+      const removedColumnNames = new Set(removed.map((o) => o.columnName))
+      let nextColumns = schema.columns
+        .filter((c) => !removedColumnNames.has(c.name))
+        .map((c) => {
+          const newType = remappedColumnTypes.get(c.name)
+          return newType ? { ...c, type: newType } : c
+        })
+      if (newColDefs.length > 0) {
+        // Splice the new column defs into the group's contiguous run rather than
+        // appending at the end. The desired in-group order is `newOutputs` (the
+        // sidebar's BFS-of-the-workflow ordering); we walk it, anchor at the first
+        // surviving sibling's index in `nextColumns`, and emit each output's
+        // column def in turn.
+        const groupColNames = new Set(newOutputs.map((o) => o.columnName))
+        const firstGroupIdx = nextColumns.findIndex((c) => groupColNames.has(c.name))
+        const anchorIdx = firstGroupIdx === -1 ? nextColumns.length : firstGroupIdx
+        const newColByLowerName = new Map(newColDefs.map((c) => [c.name.toLowerCase(), c]))
+        const orderedGroupCols: ColumnDefinition[] = []
+        for (const out of newOutputs) {
+          const fresh = newColByLowerName.get(out.columnName.toLowerCase())
+          if (fresh) {
+            orderedGroupCols.push(fresh)
+          } else {
+            const existing = nextColumns.find(
+              (c) => c.name.toLowerCase() === out.columnName.toLowerCase()
+            )
+            if (existing) orderedGroupCols.push(existing)
+          }
+        }
+        const remaining = nextColumns.filter((c) => !groupColNames.has(c.name))
+        nextColumns = [
+          ...remaining.slice(0, anchorIdx),
+          ...orderedGroupCols,
+          ...remaining.slice(anchorIdx),
+        ]
+      }
+
+      const updatedGroup: WorkflowGroup = {
+        ...group,
+        workflowId: data.workflowId ?? group.workflowId,
+        name: data.name ?? group.name,
+        dependencies: data.dependencies ?? group.dependencies,
+        outputs: newOutputs,
+        ...(data.inputMappings !== undefined ? { inputMappings: data.inputMappings } : {}),
+        ...(data.type !== undefined ? { type: data.type } : {}),
+        ...(data.autoRun !== undefined ? { autoRun: data.autoRun } : {}),
+      }
+      // Removed outputs may be referenced as deps by sibling groups; strip those
+      // refs so we don't leave dangling-column deps that fail schema validation.
+      const nextGroups = groups
+        .map((g, i) => (i === groupIndex ? updatedGroup : g))
+        .map((g) => (g.id === updatedGroup.id ? g : stripGroupDeps(g, removedColumnNames)))
+      const updatedSchema: TableSchema = {
+        ...schema,
+        columns: nextColumns,
+        workflowGroups: nextGroups,
+      }
+
+      // `columnOrder` mirrors the schema layout. Drop removed columns, then splice
+      // the new ones in at the same anchor as `nextColumns` so the table renders
+      // them inside the group's contiguous run instead of at the tail.
+      let updatedColumnOrder = table.metadata?.columnOrder?.filter(
+        (n) => !removedColumnNames.has(n)
+      )
+      if (updatedColumnOrder && newColDefs.length > 0) {
+        const newColNamesLower = new Set(newColDefs.map((c) => c.name.toLowerCase()))
+        const orderWithoutNew = updatedColumnOrder.filter(
+          (n) => !newColNamesLower.has(n.toLowerCase())
+        )
+        const groupColNames = new Set(newOutputs.map((o) => o.columnName))
+        const orderedGroupNames = newOutputs.map((o) => o.columnName)
+        const firstGroupOrderIdx = orderWithoutNew.findIndex((n) => groupColNames.has(n))
+        const anchorOrderIdx =
+          firstGroupOrderIdx === -1 ? orderWithoutNew.length : firstGroupOrderIdx
+        const remainingOrder = orderWithoutNew.filter((n) => !groupColNames.has(n))
+        updatedColumnOrder = [
+          ...remainingOrder.slice(0, anchorOrderIdx),
+          ...orderedGroupNames,
+          ...remainingOrder.slice(anchorOrderIdx),
+        ]
+      }
+      assertValidSchema(updatedSchema, updatedColumnOrder)
+
+      const updatedMetadata: TableMetadata | null =
+        updatedColumnOrder && table.metadata
+          ? { ...table.metadata, columnOrder: updatedColumnOrder }
+          : table.metadata
+            ? { ...table.metadata }
+            : null
+
+      const now = new Date()
+      await trx
+        .update(userTableDefinitions)
+        .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
+        .where(eq(userTableDefinitions.id, data.tableId))
+      for (const name of removedColumnNames) {
+        await trx.execute(
+          sql`UPDATE user_table_rows SET data = data - ${name}::text WHERE table_id = ${data.tableId} AND data ? ${name}::text`
+        )
+      }
+      // Remapped columns: clear stale values in-tx so rows the backfill can't
+      // repopulate (no log, no matching span output) end up empty rather than
+      // retaining the previous mapping's value. The backfill below then writes
+      // the new mapping's value into rows where it can find one.
+      for (const name of remappedColumnNames) {
+        if (removedColumnNames.has(name)) continue
+        await trx.execute(
+          sql`UPDATE user_table_rows SET data = data - ${name}::text WHERE table_id = ${data.tableId} AND data ? ${name}::text`
+        )
+      }
+
+      logger.info(
+        `[${requestId}] Updated workflow group "${data.groupId}" in table ${data.tableId} (added=${added.length}, removed=${removed.length}, remapped=${remappedColumnNames.size})`
+      )
+
+      const updatedTable: TableDefinition = {
+        ...table,
+        schema: updatedSchema,
+        metadata: updatedMetadata,
+        updatedAt: now,
+      }
+      return {
+        updatedTable,
+        added,
+        remappedColumnNames,
+        newOutputs,
+        previousAutoRun: group.autoRun,
+      }
+    })
+
+  // Backfill from saved execution logs so already-completed group runs surface
+  // the schema changes without re-running the workflow. Two passes:
+  //   - added outputs (new columns): never overwrite hand-edited values.
+  //   - remapped outputs (existing column re-pointed): overwrite, since the
+  //     new mapping is the source of truth and the user expects the cell to
+  //     refresh to the new output's value.
+  // Awaited so the response only returns once row data is consistent. A
+  // failed backfill is logged but doesn't fail the request — the schema
   // change has already committed.
   if (added.length > 0) {
     try {
-      await backfillAddedGroupOutputs({
+      await backfillGroupOutputsFromLogs({
         table: updatedTable,
         groupId: data.groupId,
-        addedOutputs: added,
+        outputs: added,
+        overwrite: false,
         requestId,
       })
     } catch (err) {
@@ -2915,6 +3575,39 @@ export async function updateWorkflowGroup(
         err
       )
     }
+  }
+  if (remappedColumnNames.size > 0) {
+    const remappedOutputs = newOutputs.filter((o) => remappedColumnNames.has(o.columnName))
+    try {
+      await backfillGroupOutputsFromLogs({
+        table: updatedTable,
+        groupId: data.groupId,
+        outputs: remappedOutputs,
+        overwrite: true,
+        requestId,
+      })
+    } catch (err) {
+      logger.warn(
+        `[${requestId}] Remap backfill from execution logs failed for ${data.tableId} group ${data.groupId}:`,
+        err
+      )
+    }
+  }
+
+  // autoRun toggled false → true: fire deps-satisfied rows now via the
+  // dispatcher. Mirrors the post-add path so re-enabling auto-fire doesn't
+  // require manual run clicks for rows that are already eligible.
+  if (previousAutoRun === false && data.autoRun === true) {
+    void runWorkflowColumn({
+      tableId: updatedTable.id,
+      workspaceId: updatedTable.workspaceId,
+      mode: 'new',
+      isManualRun: false,
+      groupIds: [data.groupId],
+      requestId,
+    }).catch((err) =>
+      logger.error(`[${requestId}] auto-dispatch (updateWorkflowGroup autoRun=true) failed:`, err)
+    )
   }
 
   return updatedTable
@@ -2938,22 +3631,19 @@ export async function addWorkflowGroupOutput(
   },
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) throw new Error('Table not found')
-
-  const schema = table.schema
-  const groups = schema.workflowGroups ?? []
-  const groupIndex = groups.findIndex((g) => g.id === data.groupId)
-  if (groupIndex === -1) {
+  // Phase 1 (no lock): load the workflow and resolve the pickable output plus
+  // its execution-order index. This depends only on the workflow graph (which
+  // is stable), so it runs OFF the advisory-lock critical section — holding the
+  // lock during this DB load would make concurrent adders on the same table
+  // time out waiting (the Mothership fan-out this fix targets). Phase 2
+  // re-validates that the group still maps to the same workflow under the lock.
+  const preTable = await getTableById(data.tableId)
+  if (!preTable) throw new Error('Table not found')
+  const preGroup = (preTable.schema.workflowGroups ?? []).find((g) => g.id === data.groupId)
+  if (!preGroup) {
     throw new Error(`Workflow group "${data.groupId}" not found`)
   }
-  const group = groups[groupIndex]
-
-  if (group.outputs.some((o) => o.blockId === data.blockId && o.path === data.path)) {
-    throw new Error(
-      `Workflow group "${data.groupId}" already has an output at ${data.blockId}::${data.path}`
-    )
-  }
+  const workflowId = preGroup.workflowId
 
   const [
     { loadWorkflowFromNormalizedTables },
@@ -2964,9 +3654,9 @@ export async function addWorkflowGroupOutput(
     import('@/lib/workflows/blocks/flatten-outputs'),
     import('./column-naming'),
   ])
-  const normalized = await loadWorkflowFromNormalizedTables(group.workflowId)
+  const normalized = await loadWorkflowFromNormalizedTables(workflowId)
   if (!normalized) {
-    throw new Error(`Workflow ${group.workflowId} not found`)
+    throw new Error(`Workflow ${workflowId} not found`)
   }
   const blocks = Object.values(normalized.blocks ?? {}).map((b) => ({
     id: b.id,
@@ -2979,154 +3669,184 @@ export async function addWorkflowGroupOutput(
   const match = flattened.find((f) => f.blockId === data.blockId && f.path === data.path)
   if (!match) {
     throw new Error(
-      `Output ${data.blockId}::${data.path} is not a valid pickable output on workflow ${group.workflowId}`
+      `Output ${data.blockId}::${data.path} is not a valid pickable output on workflow ${workflowId}`
     )
   }
+  const newColumnType = columnTypeForLeaf(match.leafType)
   const distances = getBlockExecutionOrder(blocks, normalized.edges ?? [])
   const flatIndex = new Map(flattened.map((f, i) => [`${f.blockId}::${f.path}`, i]))
 
-  const taken = new Set(schema.columns.map((c) => c.name))
-  const columnName = data.columnName ?? deriveOutputColumnName(data.path, taken)
-  if (!NAME_PATTERN.test(columnName)) {
-    throw new Error(`Invalid column name "${columnName}". Must satisfy ${NAME_PATTERN.source}.`)
-  }
-  if (taken.has(columnName)) {
-    throw new Error(`Column "${columnName}" already exists`)
-  }
-  if (schema.columns.length + 1 > TABLE_LIMITS.MAX_COLUMNS_PER_TABLE) {
-    throw new Error(
-      `Adding a column would exceed the maximum (${TABLE_LIMITS.MAX_COLUMNS_PER_TABLE}).`
+  // Phase 2 (locked): re-read fresh, validate against the current schema, and
+  // write. The critical section holds no I/O — just the in-memory splice + the
+  // schema UPDATE — so concurrent adders queue behind it quickly.
+  const { updatedTable, newOutput } = await withLockedTable(data.tableId, async (table, trx) => {
+    const schema = table.schema
+    const groups = schema.workflowGroups ?? []
+    const groupIndex = groups.findIndex((g) => g.id === data.groupId)
+    if (groupIndex === -1) {
+      throw new Error(`Workflow group "${data.groupId}" not found`)
+    }
+    const group = groups[groupIndex]
+    if (group.workflowId !== workflowId) {
+      throw new Error(
+        `Workflow group "${data.groupId}" was remapped to a different workflow concurrently; retry the add.`
+      )
+    }
+
+    if (group.outputs.some((o) => o.blockId === data.blockId && o.path === data.path)) {
+      throw new Error(
+        `Workflow group "${data.groupId}" already has an output at ${data.blockId}::${data.path}`
+      )
+    }
+
+    const taken = new Set(schema.columns.map((c) => c.name))
+    const columnName = data.columnName ?? deriveOutputColumnName(data.path, taken)
+    if (!NAME_PATTERN.test(columnName)) {
+      throw new Error(`Invalid column name "${columnName}". Must satisfy ${NAME_PATTERN.source}.`)
+    }
+    if (taken.has(columnName)) {
+      throw new Error(`Column "${columnName}" already exists`)
+    }
+    if (schema.columns.length + 1 > TABLE_LIMITS.MAX_COLUMNS_PER_TABLE) {
+      throw new Error(
+        `Adding a column would exceed the maximum (${TABLE_LIMITS.MAX_COLUMNS_PER_TABLE}).`
+      )
+    }
+
+    const newColDef: ColumnDefinition = {
+      name: columnName,
+      type: newColumnType,
+      required: false,
+      unique: false,
+      workflowGroupId: data.groupId,
+    }
+    const newOutput: WorkflowGroupOutput = {
+      blockId: data.blockId,
+      path: data.path,
+      columnName,
+    }
+
+    // Sort all of the group's outputs (existing + new) in workflow execution
+    // order: BFS distance from the start block ASC, with discovery order as
+    // tiebreak. This matches what the column-sidebar does at create time, so
+    // columns from the same workflow always read in the order their blocks run
+    // — regardless of whether they were added at create time or one-by-one.
+    const groupColNamesBefore = new Set(group.outputs.map((o) => o.columnName))
+    const orderKey = (o: { blockId: string; path: string }) => {
+      const d = distances[o.blockId]
+      const dist = d === undefined || d < 0 ? Number.POSITIVE_INFINITY : d
+      const idx = flatIndex.get(`${o.blockId}::${o.path}`) ?? Number.POSITIVE_INFINITY
+      return [dist, idx] as const
+    }
+    const allGroupOutputs = [...group.outputs, newOutput].sort((a, b) => {
+      const [da, ia] = orderKey(a)
+      const [db, ib] = orderKey(b)
+      return da !== db ? da - db : ia - ib
+    })
+    const orderedGroupColNames = allGroupOutputs.map((o) => o.columnName)
+    const updatedGroup: WorkflowGroup = {
+      ...group,
+      outputs: allGroupOutputs,
+    }
+    const nextGroups = groups.map((g, i) => (i === groupIndex ? updatedGroup : g))
+
+    // Splice the new column run into nextColumns: keep the columns outside the
+    // group where they were, replace the group's contiguous run with the
+    // BFS-ordered list. Anchor at the position of the first existing sibling
+    // (or append if the group was empty).
+    const colByName = new Map(schema.columns.map((c) => [c.name, c]))
+    const orderedGroupCols: ColumnDefinition[] = orderedGroupColNames.map((name) => {
+      if (name === columnName) return newColDef
+      const existing = colByName.get(name)
+      if (!existing) {
+        throw new Error(`Internal: column "${name}" missing while splicing group outputs`)
+      }
+      return existing
+    })
+    const remainingCols = schema.columns.filter((c) => !groupColNamesBefore.has(c.name))
+    const firstGroupIdx = schema.columns.findIndex((c) => groupColNamesBefore.has(c.name))
+    const colAnchor = firstGroupIdx === -1 ? remainingCols.length : firstGroupIdx
+    const nextColumns = [
+      ...remainingCols.slice(0, colAnchor),
+      ...orderedGroupCols,
+      ...remainingCols.slice(colAnchor),
+    ]
+
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: nextColumns,
+      workflowGroups: nextGroups,
+    }
+
+    const updatedColumnOrder = table.metadata?.columnOrder
+      ? (() => {
+          const orderWithoutGroup = table.metadata!.columnOrder!.filter(
+            (n) => !groupColNamesBefore.has(n)
+          )
+          const firstGroupOrderIdx = table.metadata!.columnOrder!.findIndex((n) =>
+            groupColNamesBefore.has(n)
+          )
+          const orderAnchor =
+            firstGroupOrderIdx === -1 ? orderWithoutGroup.length : firstGroupOrderIdx
+          return [
+            ...orderWithoutGroup.slice(0, orderAnchor),
+            ...orderedGroupColNames,
+            ...orderWithoutGroup.slice(orderAnchor),
+          ]
+        })()
+      : undefined
+
+    assertValidSchema(updatedSchema, updatedColumnOrder)
+
+    const updatedMetadata: TableMetadata | null =
+      updatedColumnOrder && table.metadata
+        ? { ...table.metadata, columnOrder: updatedColumnOrder }
+        : table.metadata
+          ? { ...table.metadata }
+          : null
+
+    const now = new Date()
+    await trx
+      .update(userTableDefinitions)
+      .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
+      .where(eq(userTableDefinitions.id, data.tableId))
+
+    logger.info(
+      `[${requestId}] Added output "${columnName}" (${newColDef.type}) to workflow group "${data.groupId}" in table ${data.tableId}`
+    )
+
+    const updatedTable: TableDefinition = {
+      ...table,
+      schema: updatedSchema,
+      metadata: updatedMetadata,
+      updatedAt: now,
+    }
+    return { updatedTable, newOutput }
+  })
+
+  // Backfill from saved execution logs — same flow `updateWorkflowGroup`
+  // uses for added outputs. Reads each row's saved trace spans for the
+  // group's executionId and writes the new output's value back. Existing
+  // rows that have hand-edited values are left alone (overwrite: false).
+  // Cheap compared to re-running the workflow on every row, which is what
+  // an earlier version of this code did — that mistakenly fanned out N
+  // workflow-group-cell jobs and burned compute the user didn't ask for.
+  try {
+    await backfillGroupOutputsFromLogs({
+      table: updatedTable,
+      groupId: data.groupId,
+      outputs: [newOutput],
+      overwrite: false,
+      requestId,
+    })
+  } catch (err) {
+    logger.warn(
+      `[${requestId}] Backfill from execution logs failed for ${data.tableId} group ${data.groupId} after adding output "${newOutput.columnName}":`,
+      err
     )
   }
 
-  const newColDef: ColumnDefinition = {
-    name: columnName,
-    type: columnTypeForLeaf(match.leafType),
-    required: false,
-    unique: false,
-    workflowGroupId: data.groupId,
-  }
-  const newOutput: WorkflowGroupOutput = {
-    blockId: data.blockId,
-    path: data.path,
-    columnName,
-  }
-
-  // Sort all of the group's outputs (existing + new) in workflow execution
-  // order: BFS distance from the start block ASC, with discovery order as
-  // tiebreak. This matches what the column-sidebar does at create time, so
-  // columns from the same workflow always read in the order their blocks run
-  // — regardless of whether they were added at create time or one-by-one.
-  const groupColNamesBefore = new Set(group.outputs.map((o) => o.columnName))
-  const orderKey = (o: { blockId: string; path: string }) => {
-    const d = distances[o.blockId]
-    const dist = d === undefined || d < 0 ? Number.POSITIVE_INFINITY : d
-    const idx = flatIndex.get(`${o.blockId}::${o.path}`) ?? Number.POSITIVE_INFINITY
-    return [dist, idx] as const
-  }
-  const allGroupOutputs = [...group.outputs, newOutput].sort((a, b) => {
-    const [da, ia] = orderKey(a)
-    const [db, ib] = orderKey(b)
-    return da !== db ? da - db : ia - ib
-  })
-  const orderedGroupColNames = allGroupOutputs.map((o) => o.columnName)
-  const updatedGroup: WorkflowGroup = {
-    ...group,
-    outputs: allGroupOutputs,
-  }
-  const nextGroups = groups.map((g, i) => (i === groupIndex ? updatedGroup : g))
-
-  // Splice the new column run into nextColumns: keep the columns outside the
-  // group where they were, replace the group's contiguous run with the
-  // BFS-ordered list. Anchor at the position of the first existing sibling
-  // (or append if the group was empty).
-  const colByName = new Map(schema.columns.map((c) => [c.name, c]))
-  const orderedGroupCols: ColumnDefinition[] = orderedGroupColNames.map((name) => {
-    if (name === columnName) return newColDef
-    const existing = colByName.get(name)
-    if (!existing) {
-      throw new Error(`Internal: column "${name}" missing while splicing group outputs`)
-    }
-    return existing
-  })
-  const remainingCols = schema.columns.filter((c) => !groupColNamesBefore.has(c.name))
-  const firstGroupIdx = schema.columns.findIndex((c) => groupColNamesBefore.has(c.name))
-  const colAnchor = firstGroupIdx === -1 ? remainingCols.length : firstGroupIdx
-  const nextColumns = [
-    ...remainingCols.slice(0, colAnchor),
-    ...orderedGroupCols,
-    ...remainingCols.slice(colAnchor),
-  ]
-
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: nextColumns,
-    workflowGroups: nextGroups,
-  }
-
-  const updatedColumnOrder = table.metadata?.columnOrder
-    ? (() => {
-        const orderWithoutGroup = table.metadata!.columnOrder!.filter(
-          (n) => !groupColNamesBefore.has(n)
-        )
-        const firstGroupOrderIdx = table.metadata!.columnOrder!.findIndex((n) =>
-          groupColNamesBefore.has(n)
-        )
-        const orderAnchor =
-          firstGroupOrderIdx === -1 ? orderWithoutGroup.length : firstGroupOrderIdx
-        return [
-          ...orderWithoutGroup.slice(0, orderAnchor),
-          ...orderedGroupColNames,
-          ...orderWithoutGroup.slice(orderAnchor),
-        ]
-      })()
-    : undefined
-
-  assertValidSchema(updatedSchema, updatedColumnOrder)
-
-  const updatedMetadata: TableMetadata | null =
-    updatedColumnOrder && table.metadata
-      ? { ...table.metadata, columnOrder: updatedColumnOrder }
-      : table.metadata
-        ? { ...table.metadata }
-        : null
-
-  const now = new Date()
-  await db
-    .update(userTableDefinitions)
-    .set({ schema: updatedSchema, metadata: updatedMetadata, updatedAt: now })
-    .where(eq(userTableDefinitions.id, data.tableId))
-
-  logger.info(
-    `[${requestId}] Added output "${columnName}" (${newColDef.type}) to workflow group "${data.groupId}" in table ${data.tableId}`
-  )
-
-  // Backfill: re-run the group on every dep-satisfied row (including ones
-  // that previously completed) so the new column actually gets populated.
-  // Adding an output without values defeats the point — the user wants the
-  // values, not just the empty header.
-  void (async () => {
-    try {
-      const { triggerWorkflowGroupRun } = await import('./workflow-columns')
-      const { triggered } = await triggerWorkflowGroupRun({
-        tableId: data.tableId,
-        groupId: data.groupId,
-        workspaceId: table.workspaceId,
-        mode: 'all',
-        requestId,
-      })
-      logger.info(
-        `[${requestId}] Backfilled ${triggered} row(s) after adding output "${columnName}"`
-      )
-    } catch (err) {
-      logger.error(
-        `[${requestId}] Failed to backfill rows after adding output "${columnName}":`,
-        err
-      )
-    }
-  })()
-
-  return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
+  return updatedTable
 }
 
 /**
@@ -3139,46 +3859,43 @@ export async function deleteWorkflowGroupOutput(
   data: { tableId: string; groupId: string; columnName: string },
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) throw new Error('Table not found')
+  return withLockedTable(data.tableId, async (table, trx) => {
+    const schema = table.schema
+    const groups = schema.workflowGroups ?? []
+    const groupIndex = groups.findIndex((g) => g.id === data.groupId)
+    if (groupIndex === -1) {
+      throw new Error(`Workflow group "${data.groupId}" not found`)
+    }
+    const group = groups[groupIndex]
+    if (!group.outputs.some((o) => o.columnName === data.columnName)) {
+      throw new Error(
+        `Workflow group "${data.groupId}" has no output bound to column "${data.columnName}"`
+      )
+    }
 
-  const schema = table.schema
-  const groups = schema.workflowGroups ?? []
-  const groupIndex = groups.findIndex((g) => g.id === data.groupId)
-  if (groupIndex === -1) {
-    throw new Error(`Workflow group "${data.groupId}" not found`)
-  }
-  const group = groups[groupIndex]
-  if (!group.outputs.some((o) => o.columnName === data.columnName)) {
-    throw new Error(
-      `Workflow group "${data.groupId}" has no output bound to column "${data.columnName}"`
-    )
-  }
+    const updatedGroup: WorkflowGroup = {
+      ...group,
+      outputs: group.outputs.filter((o) => o.columnName !== data.columnName),
+    }
+    const nextGroups = groups.map((g, i) => (i === groupIndex ? updatedGroup : g))
+    const nextColumns = schema.columns.filter((c) => c.name !== data.columnName)
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: nextColumns,
+      workflowGroups: nextGroups,
+    }
 
-  const updatedGroup: WorkflowGroup = {
-    ...group,
-    outputs: group.outputs.filter((o) => o.columnName !== data.columnName),
-  }
-  const nextGroups = groups.map((g, i) => (i === groupIndex ? updatedGroup : g))
-  const nextColumns = schema.columns.filter((c) => c.name !== data.columnName)
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: nextColumns,
-    workflowGroups: nextGroups,
-  }
+    const updatedColumnOrder = table.metadata?.columnOrder?.filter((n) => n !== data.columnName)
+    assertValidSchema(updatedSchema, updatedColumnOrder)
 
-  const updatedColumnOrder = table.metadata?.columnOrder?.filter((n) => n !== data.columnName)
-  assertValidSchema(updatedSchema, updatedColumnOrder)
+    const updatedMetadata: TableMetadata | null =
+      updatedColumnOrder && table.metadata
+        ? { ...table.metadata, columnOrder: updatedColumnOrder }
+        : table.metadata
+          ? { ...table.metadata }
+          : null
 
-  const updatedMetadata: TableMetadata | null =
-    updatedColumnOrder && table.metadata
-      ? { ...table.metadata, columnOrder: updatedColumnOrder }
-      : table.metadata
-        ? { ...table.metadata }
-        : null
-
-  const now = new Date()
-  await db.transaction(async (trx) => {
+    const now = new Date()
     await setTableTxTimeouts(trx, { statementMs: 60_000 })
     await trx
       .update(userTableDefinitions)
@@ -3187,13 +3904,13 @@ export async function deleteWorkflowGroupOutput(
     await trx.execute(
       sql`UPDATE user_table_rows SET data = data - ${data.columnName}::text WHERE table_id = ${data.tableId} AND data ? ${data.columnName}::text`
     )
+
+    logger.info(
+      `[${requestId}] Removed output "${data.columnName}" from workflow group "${data.groupId}" in table ${data.tableId}`
+    )
+
+    return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
   })
-
-  logger.info(
-    `[${requestId}] Removed output "${data.columnName}" from workflow group "${data.groupId}" in table ${data.tableId}`
-  )
-
-  return { ...table, schema: updatedSchema, metadata: updatedMetadata, updatedAt: now }
 }
 
 /**
@@ -3204,47 +3921,38 @@ export async function deleteWorkflowGroup(
   data: DeleteWorkflowGroupData,
   requestId: string
 ): Promise<TableDefinition> {
-  const table = await getTableById(data.tableId)
-  if (!table) {
-    throw new Error('Table not found')
-  }
+  return withLockedTable(data.tableId, async (table, trx) => {
+    const schema = table.schema
+    const groups = schema.workflowGroups ?? []
+    const group = groups.find((g) => g.id === data.groupId)
+    if (!group) {
+      throw new Error(`Workflow group "${data.groupId}" not found`)
+    }
 
-  const schema = table.schema
-  const groups = schema.workflowGroups ?? []
-  const group = groups.find((g) => g.id === data.groupId)
-  if (!group) {
-    throw new Error(`Workflow group "${data.groupId}" not found`)
-  }
+    const removedColumnNames = new Set(group.outputs.map((o) => o.columnName))
+    // Removed group's output columns may be referenced as deps by sibling groups.
+    // Strip those refs so we don't leave dangling-column deps behind.
+    const nextGroups = groups
+      .filter((g) => g.id !== data.groupId)
+      .map((g) => stripGroupDeps(g, removedColumnNames))
+    const updatedSchema: TableSchema = {
+      ...schema,
+      columns: schema.columns.filter((c) => !removedColumnNames.has(c.name)),
+      workflowGroups: nextGroups,
+    }
+    const updatedColumnOrder = table.metadata?.columnOrder?.filter(
+      (n) => !removedColumnNames.has(n)
+    )
+    assertValidSchema(updatedSchema, updatedColumnOrder)
 
-  const removedColumnNames = new Set(group.outputs.map((o) => o.columnName))
-  const nextGroups = groups
-    .filter((g) => g.id !== data.groupId)
-    .map((g) => ({
-      ...g,
-      dependencies: g.dependencies?.workflowGroups
-        ? {
-            ...(g.dependencies.columns ? { columns: g.dependencies.columns } : {}),
-            workflowGroups: g.dependencies.workflowGroups.filter((id) => id !== data.groupId),
-          }
-        : g.dependencies,
-    }))
-  const updatedSchema: TableSchema = {
-    ...schema,
-    columns: schema.columns.filter((c) => !removedColumnNames.has(c.name)),
-    workflowGroups: nextGroups,
-  }
-  const updatedColumnOrder = table.metadata?.columnOrder?.filter((n) => !removedColumnNames.has(n))
-  assertValidSchema(updatedSchema, updatedColumnOrder)
+    const updatedMetadata: TableMetadata | null =
+      updatedColumnOrder && table.metadata
+        ? { ...table.metadata, columnOrder: updatedColumnOrder }
+        : table.metadata
+          ? { ...table.metadata }
+          : null
 
-  const updatedMetadata: TableMetadata | null =
-    updatedColumnOrder && table.metadata
-      ? { ...table.metadata, columnOrder: updatedColumnOrder }
-      : table.metadata
-        ? { ...table.metadata }
-        : null
-
-  const now = new Date()
-  await db.transaction(async (trx) => {
+    const now = new Date()
     await setTableTxTimeouts(trx, { statementMs: 60_000 })
     await trx
       .update(userTableDefinitions)
@@ -3255,19 +3963,19 @@ export async function deleteWorkflowGroup(
         sql`UPDATE user_table_rows SET data = data - ${name}::text WHERE table_id = ${data.tableId} AND data ? ${name}::text`
       )
     }
-    await trx.execute(
-      sql`UPDATE user_table_rows SET executions = executions - ${data.groupId}::text WHERE table_id = ${data.tableId} AND executions ? ${data.groupId}::text`
+    await stripGroupExecutions(trx, data.tableId, [data.groupId])
+
+    logger.info(
+      `[${requestId}] Deleted workflow group "${data.groupId}" from table ${data.tableId}`
     )
+
+    return {
+      ...table,
+      schema: updatedSchema,
+      metadata: updatedMetadata,
+      updatedAt: now,
+    }
   })
-
-  logger.info(`[${requestId}] Deleted workflow group "${data.groupId}" from table ${data.tableId}`)
-
-  return {
-    ...table,
-    schema: updatedSchema,
-    metadata: updatedMetadata,
-    updatedAt: now,
-  }
 }
 
 /** Minimal shape of a trace span we care about for backfill. */
@@ -3291,59 +3999,101 @@ function findSpanByBlockId(
   return undefined
 }
 
-async function backfillAddedGroupOutputs(opts: {
+/**
+ * Walks completed group executions and pulls each target output's value out of
+ * the workflow's saved trace spans, writing it back into row data. Used in two
+ * spots:
+ *
+ *   - **added** outputs (new columns added to an existing group): `overwrite`
+ *     is false, so rows with a hand-edited value already in the column are
+ *     left alone.
+ *   - **remapped** outputs (existing column re-pointed at a different
+ *     `(blockId, path)`): `overwrite` is true — the new mapping is the source
+ *     of truth, and the user expects the column to refresh to the new
+ *     output's value rather than retain the stale old one.
+ */
+async function backfillGroupOutputsFromLogs(opts: {
   table: TableDefinition
   groupId: string
-  addedOutputs: WorkflowGroupOutput[]
+  outputs: WorkflowGroupOutput[]
+  overwrite: boolean
   requestId: string
 }): Promise<void> {
-  const { table, groupId, addedOutputs, requestId } = opts
-  if (addedOutputs.length === 0) return
+  const { table, groupId, outputs, overwrite, requestId } = opts
+  if (outputs.length === 0) return
 
   const { pluckByPath } = await import('./pluck')
 
-  const rowRecords = await db
-    .select()
-    .from(userTableRows)
-    .where(eq(userTableRows.tableId, table.id))
+  // Find rows whose group execution completed and grab their executionId
+  // directly from the sidecar — hits the (table_id, group_id) index, no
+  // table scan over rowdata.
+  const completedExecs = await db
+    .select({
+      rowId: tableRowExecutions.rowId,
+      executionId: tableRowExecutions.executionId,
+    })
+    .from(tableRowExecutions)
+    .where(
+      and(
+        eq(tableRowExecutions.tableId, table.id),
+        eq(tableRowExecutions.groupId, groupId),
+        eq(tableRowExecutions.status, 'completed')
+      )
+    )
 
-  // Collect unique executionIds across rows whose group execution completed.
   const executionIdsByRow = new Map<string, string>()
-  for (const r of rowRecords) {
-    const exec = (r.executions as RowExecutions)?.[groupId]
-    if (!exec || exec.status !== 'completed' || !exec.executionId) continue
-    executionIdsByRow.set(r.id, exec.executionId)
+  for (const e of completedExecs) {
+    if (!e.executionId) continue
+    executionIdsByRow.set(e.rowId, e.executionId)
   }
   if (executionIdsByRow.size === 0) return
+
+  const rowRecords = await db
+    .select({ id: userTableRows.id, data: userTableRows.data })
+    .from(userTableRows)
+    .where(
+      and(
+        eq(userTableRows.tableId, table.id),
+        inArray(userTableRows.id, Array.from(executionIdsByRow.keys()))
+      )
+    )
 
   const executionIds = Array.from(new Set(executionIdsByRow.values()))
   const logs = await db
     .select({
       executionId: workflowExecutionLogs.executionId,
+      workflowId: workflowExecutionLogs.workflowId,
+      workspaceId: workflowExecutionLogs.workspaceId,
       executionData: workflowExecutionLogs.executionData,
     })
     .from(workflowExecutionLogs)
     .where(inArray(workflowExecutionLogs.executionId, executionIds))
 
   const logByExecutionId = new Map<string, { traceSpans?: BackfillTraceSpan[] }>()
-  for (const log of logs) {
+  // Heavy execution data may live in object storage; resolve pointers (bounded
+  // concurrency) so trace spans are available for table-column enrichment.
+  await mapWithConcurrency(logs, MATERIALIZE_CONCURRENCY, async (log) => {
+    const executionData = await materializeExecutionData(
+      log.executionData as Record<string, unknown> | null,
+      { workspaceId: log.workspaceId, workflowId: log.workflowId, executionId: log.executionId }
+    )
     logByExecutionId.set(
       log.executionId,
-      (log.executionData as { traceSpans?: BackfillTraceSpan[] }) ?? {}
+      (executionData as { traceSpans?: BackfillTraceSpan[] }) ?? {}
     )
-  }
+  })
 
   const updates: Array<{ rowId: string; data: RowData }> = []
   for (const r of rowRecords) {
-    const exec = (r.executions as RowExecutions)?.[groupId]
-    if (!exec?.executionId) continue
-    const log = logByExecutionId.get(exec.executionId)
+    const execId = executionIdsByRow.get(r.id)
+    if (!execId) continue
+    const log = logByExecutionId.get(execId)
     if (!log) continue
 
     const dataPatch: RowData = {}
     let mutated = false
-    for (const out of addedOutputs) {
-      if ((r.data as RowData)[out.columnName] !== undefined) continue
+    for (const out of outputs) {
+      if (!overwrite && (r.data as RowData)[out.columnName] !== undefined) continue
       const span = findSpanByBlockId(log.traceSpans, out.blockId)
       if (!span?.output) continue
       const picked = pluckByPath(span.output, out.path)
@@ -3368,7 +4118,7 @@ async function backfillAddedGroupOutputs(opts: {
   )
 
   logger.info(
-    `[${requestId}] Backfilled ${updates.length} row(s) for group "${groupId}" in table ${table.id}`
+    `[${requestId}] Backfilled ${updates.length} row(s) for group "${groupId}" in table ${table.id} (${overwrite ? 'remapped' : 'added'})`
   )
 }
 

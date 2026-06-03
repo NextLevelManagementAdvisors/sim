@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { defineRouteContract } from '@/lib/api/contracts/types'
+import { type ContractJsonResponse, defineRouteContract } from '@/lib/api/contracts/types'
 import type {
   CsvHeaderMapping,
   Filter,
@@ -15,7 +15,7 @@ import { CSV_MAX_FILE_SIZE_BYTES } from '@/lib/table/import'
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
-const domainObjectSchema = <T>() => z.custom<T>(isRecord)
+export const domainObjectSchema = <T>() => z.custom<T>(isRecord)
 
 /**
  * Column types are a fixed enum derived from `COLUMN_TYPES` so callers cannot
@@ -135,6 +135,7 @@ export const deleteTableColumnBodySchema = z.object({
 export const tableMetadataSchema = z.object({
   columnWidths: z.record(z.string(), z.number().positive()).optional(),
   columnOrder: z.array(z.string()).optional(),
+  pinnedColumns: z.array(z.string()).optional(),
 }) satisfies z.ZodType<TableMetadata>
 
 export const updateTableMetadataBodySchema = z.object({
@@ -330,6 +331,7 @@ export const listTablesContract = defineRouteContract({
     ),
   },
 })
+export type ListTablesResponse = ContractJsonResponse<typeof listTablesContract>
 
 export const createTableContract = defineRouteContract({
   method: 'POST',
@@ -356,6 +358,7 @@ export const getTableContract = defineRouteContract({
     schema: successResponseSchema(z.object({ table: tableDefinitionSchema })),
   },
 })
+export type GetTableResponse = ContractJsonResponse<typeof getTableContract>
 
 export const renameTableContract = defineRouteContract({
   method: 'PATCH',
@@ -385,7 +388,7 @@ export const restoreTableContract = defineRouteContract({
   params: tableIdParamsSchema,
   response: {
     mode: 'json',
-    schema: z.object({ success: z.literal(true) }),
+    schema: successResponseSchema(z.object({ table: tableDefinitionSchema })),
   },
 })
 
@@ -710,18 +713,28 @@ export const deleteTableRowsContract = defineRouteContract({
 
 // ============================================================================
 // Workflow group contracts (`/api/table/[tableId]/groups`, `/cancel-runs`,
-// `/groups/[groupId]/run`, `/rows/[rowId]/run-workflow-group`)
+// `/columns/run`, `/rows/run`, `/rows/[rowId]/cells/[groupId]/run`)
 // ============================================================================
 
 const workflowGroupOutputSchema = z.object({
-  blockId: z.string().min(1),
-  path: z.string().min(1),
+  // Workflow outputs carry blockId/path; enrichment outputs carry outputId and
+  // leave these empty. `.default('')` keeps the parsed value a plain string.
+  blockId: z.string().default(''),
+  path: z.string().default(''),
+  outputId: z.string().optional(),
   columnName: z.string().min(1),
 })
 
 const workflowGroupDependenciesSchema = z.object({
   columns: z.array(z.string()).optional(),
-  workflowGroups: z.array(z.string()).optional(),
+})
+
+const workflowGroupTypeSchema = z.enum(['manual', 'enrichment'])
+
+/** One workflow Start-block input field ← one table column. */
+const workflowGroupInputMappingSchema = z.object({
+  inputName: z.string().min(1, 'inputName cannot be empty'),
+  columnName: z.string().min(1, 'columnName cannot be empty'),
 })
 
 const workflowGroupOutputColumnSchema = z.object({
@@ -740,16 +753,43 @@ export const addWorkflowGroupBodySchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
   group: z.object({
     id: z.string().min(1),
-    workflowId: z.string().min(1),
+    /** Workflow id for manual groups; `''` (or omitted) for enrichment groups. */
+    workflowId: z.string().default(''),
+    /** Registry enrichment id for enrichment groups. */
+    enrichmentId: z.string().min(1).optional(),
     name: z.string().optional(),
+    /** Provenance of the group; defaults to `'manual'` when omitted. */
+    type: workflowGroupTypeSchema.optional(),
     dependencies: workflowGroupDependenciesSchema.optional(),
     outputs: z.array(workflowGroupOutputSchema).min(1),
+    /** Maps the workflow's Start-block inputs to table columns. */
+    inputMappings: z.array(workflowGroupInputMappingSchema).optional(),
+    /** When `false`, the group never auto-fires from the scheduler — it can
+     *  only be triggered manually. Defaults to `true`. Persisted on the
+     *  group; distinct from the top-level `autoRun` below which is a
+     *  one-shot "schedule existing rows on creation" flag. */
+    autoRun: z.boolean().optional(),
   }),
   outputColumns: z.array(workflowGroupOutputColumnSchema).min(1),
   /** When false, skip auto-scheduling existing rows after the group is added.
    *  Defaults to true so UI adds populate cells immediately; the Mothership
    *  tool sends `false` so the AI can stage groups without firing runs. */
   autoRun: z.boolean().optional(),
+})
+
+/**
+ * Re-points an existing column to a different workflow output. Use when the
+ * user changes which `(blockId, path)` flows into a column they already have,
+ * without restructuring the rest of the group's outputs. Distinct from the
+ * `outputs` add/remove diff: the column keeps its identity, type, deps, and
+ * row position; only its source mapping changes. Existing row values for the
+ * column are backfilled from saved execution logs at the new `(blockId, path)`
+ * — rows whose log has no value for the new mapping end up empty.
+ */
+const workflowGroupMappingUpdateSchema = z.object({
+  columnName: z.string().min(1),
+  blockId: z.string().min(1),
+  path: z.string().min(1),
 })
 
 export const updateWorkflowGroupBodySchema = z.object({
@@ -760,6 +800,18 @@ export const updateWorkflowGroupBodySchema = z.object({
   dependencies: workflowGroupDependenciesSchema.optional(),
   outputs: z.array(workflowGroupOutputSchema).optional(),
   newOutputColumns: z.array(workflowGroupOutputColumnSchema).optional(),
+  /**
+   * Per-column mapping swaps: keep the column, change the source `(blockId,
+   * path)`. Applied before the `outputs` add/remove diff. Each entry's
+   * `columnName` must already exist in the group's outputs.
+   */
+  mappingUpdates: z.array(workflowGroupMappingUpdateSchema).optional(),
+  /** Replace the group's input mappings. Omit to leave unchanged. */
+  inputMappings: z.array(workflowGroupInputMappingSchema).optional(),
+  /** Update the group's provenance. Omit to leave unchanged. */
+  type: workflowGroupTypeSchema.optional(),
+  /** Toggle the group's persisted auto-run flag. Omit to leave unchanged. */
+  autoRun: z.boolean().optional(),
 })
 
 export const deleteWorkflowGroupBodySchema = z.object({
@@ -840,7 +892,7 @@ export const cancelTableRunsContract = defineRouteContract({
 })
 
 /**
- * Run modes for `POST /api/table/[tableId]/groups/[groupId]/run`:
+ * Run modes for `POST /api/table/[tableId]/columns/run`:
  *  - `all`        — every dep-satisfied row not already running/pending
  *  - `incomplete` — same, but additionally restricted to rows whose group has
  *    never run, or whose last run ended in `failed`/`aborted`
@@ -848,40 +900,51 @@ export const cancelTableRunsContract = defineRouteContract({
  * Field is named `runMode` (not `mode`) to disambiguate from the table-import
  * `mode` arg (`append` / `replace`) which lives on a different op.
  */
-export const runWorkflowGroupBodySchema = z.object({
+/**
+ * Run a set of workflow groups across the table or a row subset. The single
+ * canonical user-driven run op — every UI gesture (single cell, per-row Play,
+ * action-bar Play/Refresh, column-header menu) reduces to a `groupIds` +
+ * optional `rowIds` shape. AI uses the `run_column` tool op.
+ */
+/**
+ * Optional cap on how much work the dispatch does before completing. The
+ * discriminated `type` keeps it extensible — only `'rows'` exists today
+ * (`max` = number of eligible rows to run before stopping), but future kinds
+ * (`'cells'`, `'cost'`, …) can extend the union without reshaping the request.
+ */
+export const runLimitSchema = z.object({
+  type: z.literal('rows'),
+  max: z
+    .number()
+    .int('max must be a whole number')
+    .min(1, 'max must be at least 1')
+    .max(1_000_000, 'max cannot exceed 1,000,000'),
+})
+
+export const runColumnBodySchema = z.object({
   workspaceId: z.string().min(1, 'Workspace ID is required'),
+  groupIds: z.array(z.string().min(1)).min(1),
   runMode: z.enum(['all', 'incomplete']).default('all'),
-  /** Optional row scope. When provided, only these rows are candidates — the
-   *  same eligibility predicate (deps satisfied, not in-flight, runMode filter)
-   *  still applies, so a passed-in row that's mid-run or has unmet deps is
-   *  silently skipped. Omit to run across the entire table. */
   rowIds: z.array(z.string().min(1)).min(1).optional(),
+  /** Cap the run to the first `max` eligible rows. Omit for an unbounded run. */
+  limit: runLimitSchema.optional(),
 })
 
-export const runWorkflowGroupContract = defineRouteContract({
+export const runColumnContract = defineRouteContract({
   method: 'POST',
-  path: '/api/table/[tableId]/groups/[groupId]/run',
-  params: groupIdParamsSchema,
-  body: runWorkflowGroupBodySchema,
+  path: '/api/table/[tableId]/columns/run',
+  params: tableIdParamsSchema,
+  body: runColumnBodySchema,
   response: {
     mode: 'json',
-    schema: successResponseSchema(z.object({ triggered: z.number() })),
-  },
-})
-
-export const runRowWorkflowGroupBodySchema = z.object({
-  workspaceId: z.string().min(1, 'Workspace ID is required'),
-  groupId: z.string().min(1, 'Group ID is required'),
-})
-
-export const runRowWorkflowGroupContract = defineRouteContract({
-  method: 'POST',
-  path: '/api/table/[tableId]/rows/[rowId]/run-workflow-group',
-  params: tableRowParamsSchema,
-  body: runRowWorkflowGroupBodySchema,
-  response: {
-    mode: 'json',
-    schema: successResponseSchema(z.object({ executionId: z.string() })),
+    /**
+     * `dispatchId` is the id of the `table_run_dispatches` row created for
+     * this run. The dispatcher task picks it up and crawls the table row by
+     * row; clients receive cell + dispatch events via SSE. Null when
+     * trigger.dev is disabled — in that mode cells run inline in-process and
+     * no dispatch row is created.
+     */
+    schema: successResponseSchema(z.object({ dispatchId: z.string().min(1).nullable() })),
   },
 })
 
@@ -889,5 +952,73 @@ export type AddWorkflowGroupBodyInput = z.input<typeof addWorkflowGroupBodySchem
 export type UpdateWorkflowGroupBodyInput = z.input<typeof updateWorkflowGroupBodySchema>
 export type DeleteWorkflowGroupBodyInput = z.input<typeof deleteWorkflowGroupBodySchema>
 export type CancelTableRunsBodyInput = z.input<typeof cancelTableRunsBodySchema>
-export type RunWorkflowGroupBodyInput = z.input<typeof runWorkflowGroupBodySchema>
-export type RunRowWorkflowGroupBodyInput = z.input<typeof runRowWorkflowGroupBodySchema>
+export type RunColumnBodyInput = z.input<typeof runColumnBodySchema>
+/** Shared `runMode` union — used by every UI / hook / Mothership site that
+ *  builds a run-column payload. Single source of truth for the literal pair. */
+export type RunMode = NonNullable<RunColumnBodyInput['runMode']>
+/** Run cap shape consumed by hooks/components building a capped run payload. */
+export type RunLimit = z.input<typeof runLimitSchema>
+
+/**
+ * Active dispatch overlay: rows in the scope ahead of `cursor` render as
+ * `pending` on refresh, so a long Run-all doesn't lose its queued indicators.
+ * Returned by `GET /api/table/[tableId]/dispatches`; mirrored client-side via
+ * `kind: 'dispatch'` SSE events.
+ */
+export const activeDispatchSchema = z.object({
+  id: z.string(),
+  status: z.enum(['pending', 'dispatching']),
+  mode: z.enum(['all', 'incomplete', 'new']),
+  isManualRun: z.boolean(),
+  cursor: z.number().int(),
+  scope: z.object({
+    groupIds: z.array(z.string()),
+    rowIds: z.array(z.string()).optional(),
+  }),
+  /** Present when the run is capped. The client's "about to run" overlay skips
+   *  capped dispatches — it can't tell which rows ahead of the cursor fall
+   *  within the budget, so it would over-render Queued; the dispatcher's real
+   *  per-row pending stamps cover the actual rows instead. */
+  limit: runLimitSchema.optional(),
+})
+
+export const listActiveDispatchesContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/table/[tableId]/dispatches',
+  params: tableIdParamsSchema,
+  response: {
+    mode: 'json',
+    schema: successResponseSchema(
+      z.object({
+        dispatches: z.array(activeDispatchSchema),
+        /** Total cells across the table whose `status === 'running'`. The
+         *  client maintains this incrementally via cell SSE events; this
+         *  field is the bootstrap snapshot on mount. */
+        runningCellCount: z.number().int().nonnegative(),
+        /** Map rowId → number of running cells on that row. Drives the
+         *  per-row badge next to the Stop button. */
+        runningByRowId: z.record(z.string(), z.number().int().positive()),
+      })
+    ),
+  },
+})
+
+export type ActiveDispatch = z.output<typeof activeDispatchSchema>
+
+export const tableEventStreamQuerySchema = z.object({
+  from: z.preprocess((value) => {
+    if (typeof value !== 'string') return 0
+    const parsed = Number.parseInt(value, 10)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  }, z.number().int().min(0)),
+})
+
+export const tableEventStreamContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/table/[tableId]/events/stream',
+  params: tableIdParamsSchema,
+  query: tableEventStreamQuerySchema,
+  response: {
+    mode: 'stream',
+  },
+})

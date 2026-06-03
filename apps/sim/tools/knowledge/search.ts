@@ -55,6 +55,19 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
       description:
         'Cohere rerank model to use (one of: rerank-v4.0-pro, rerank-v4.0-fast, rerank-v3.5)',
     },
+    rerankerInputCount: {
+      type: 'number',
+      required: false,
+      visibility: 'user-only',
+      description:
+        'Number of vector results sent to the Cohere reranker (1–100). Defaults to topK × 4 capped at 100.',
+    },
+    apiKey: {
+      type: 'string',
+      required: false,
+      visibility: 'user-only',
+      description: 'Cohere API key for reranker (self-hosted deployments only)',
+    },
   },
 
   schemaEnrichment: {
@@ -84,13 +97,29 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
         typeof params.rerankerModel === 'string' && params.rerankerModel.length > 0
           ? params.rerankerModel
           : DEFAULT_RERANKER_MODEL
+      const rerankerApiKey =
+        typeof params.apiKey === 'string' && params.apiKey.length > 0 ? params.apiKey : undefined
+      const rawInputCount =
+        params.rerankerInputCount !== undefined &&
+        params.rerankerInputCount !== null &&
+        params.rerankerInputCount !== ''
+          ? Number(params.rerankerInputCount)
+          : Number.NaN
+      const rerankerInputCount = Number.isFinite(rawInputCount)
+        ? Math.max(1, Math.min(100, Math.floor(rawInputCount)))
+        : undefined
 
       const requestBody = {
         knowledgeBaseIds,
         query: params.query,
         topK: params.topK ? Math.max(1, Math.min(100, Number(params.topK))) : 10,
         ...(structuredFilters.length > 0 && { tagFilters: structuredFilters }),
-        ...(rerankerEnabled && { rerankerEnabled: true, rerankerModel }),
+        ...(rerankerEnabled && {
+          rerankerEnabled: true,
+          rerankerModel,
+          ...(rerankerInputCount !== undefined && { rerankerInputCount }),
+          ...(rerankerApiKey && { rerankerApiKey }),
+        }),
         ...(workflowId && { workflowId }),
       }
 
@@ -148,6 +177,12 @@ export const knowledgeSearchTool: ToolConfig<any, KnowledgeSearchResponse> = {
         properties: {
           documentId: { type: 'string', description: 'Document ID' },
           documentName: { type: 'string', description: 'Document name' },
+          sourceUrl: {
+            type: 'string',
+            nullable: true,
+            description:
+              'URL to the original source document (e.g., Confluence page, Google Doc, Notion page). Null for documents without an external source.',
+          },
           content: { type: 'string', description: 'Content of the result' },
           chunkIndex: { type: 'number', description: 'Index of the chunk within the document' },
           similarity: { type: 'number', description: 'Similarity score of the result' },

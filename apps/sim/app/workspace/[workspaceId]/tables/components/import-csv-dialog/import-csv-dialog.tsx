@@ -2,6 +2,7 @@
 
 import { useMemo, useRef, useState } from 'react'
 import { createLogger } from '@sim/logger'
+import { getErrorMessage } from '@sim/utils/errors'
 import {
   Button,
   ButtonGroup,
@@ -12,6 +13,7 @@ import {
   Modal,
   ModalBody,
   ModalContent,
+  ModalDescription,
   ModalFooter,
   ModalHeader,
   Table,
@@ -46,8 +48,8 @@ const CREATE_VALUE = '__ create __'
 /**
  * Converts the verbose backend error messages into a short, human-friendly
  * summary suitable for the modal footer. Specifically collapses repeated
- * `Row N: Column "X" must be unique. Value "Y" already exists in row row_abc`
- * segments into a single concise summary without internal row IDs.
+ * `Row N: Column "X" must be unique. Value "Y" already exists in row M`
+ * segments into a single concise summary.
  */
 function summarizeImportError(message: string): string {
   const uniqueMatches = [
@@ -75,9 +77,9 @@ function summarizeImportError(message: string): string {
     return rowLimitMatch[0].trim()
   }
 
-  const stripped = message.replace(/\s+in row\s+row_[a-f0-9]+/gi, '').trim()
-  if (stripped.length > 180) return `${stripped.slice(0, 177)}...`
-  return stripped
+  const trimmed = message.trim()
+  if (trimmed.length > 180) return `${trimmed.slice(0, 177)}...`
+  return trimmed
 }
 
 interface ImportCsvDialogProps {
@@ -171,7 +173,7 @@ export function ImportCsvDialog({
       })
       setMapping(autoMapping)
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to parse CSV'
+      const message = getErrorMessage(err, 'Failed to parse CSV')
       logger.error('CSV parse failed', err)
       setParseError(message)
     } finally {
@@ -326,7 +328,7 @@ export function ImportCsvDialog({
       })
       onOpenChange(false)
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to import CSV'
+      const message = getErrorMessage(err, 'Failed to import CSV')
       setSubmitError(summarizeImportError(message))
       logger.error('CSV import into existing table failed', err)
     }
@@ -343,9 +345,12 @@ export function ImportCsvDialog({
       <ModalContent size='lg'>
         <ModalHeader>Import CSV into {table.name}</ModalHeader>
         <ModalBody>
+          <ModalDescription className='sr-only'>
+            Upload and map a CSV file to import rows into the table
+          </ModalDescription>
           {!parsed ? (
             <div className='flex flex-col gap-2'>
-              <Label>Upload CSV</Label>
+              <Label>Import CSV</Label>
               <Button
                 type='button'
                 variant='default'
